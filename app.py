@@ -33,11 +33,11 @@ def init_db():
     if "last_name" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
 
-    existing = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
+    existing = conn.execute("SELECT id FROM users WHERE username='admin@example.com'").fetchone()
     if not existing:
         conn.execute(
             "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
-            ("admin", "System", "Admin", "admin123", "admin"),
+            ("admin@example.com", "System", "Admin", "admin123", "admin"),
         )
     conn.commit()
     conn.close()
@@ -121,12 +121,17 @@ def layout(title, content, user, flash=None):
     if flash:
         flash_html = f"<div class='alert alert-{flash.get('kind', 'info')}'>{html.escape(flash.get('msg', ''))}</div>"
 
-    left_col = """
+    nav_admin_link = ""
+    if user.get("role") == "admin":
+        nav_admin_link = "<a class='list-group-item list-group-item-action' href='/admin/users'>Benutzerverwaltung</a>"
+
+    left_col = f"""
     <div class='card shadow-sm'>
       <div class='card-header'>Navigation</div>
       <div class='list-group list-group-flush'>
         <a class='list-group-item list-group-item-action' href='/dashboard'>Dashboard</a>
-        <a class='list-group-item list-group-item-action' href='/admin/users'>Benutzerverwaltung</a>
+        <a class='list-group-item list-group-item-action' href='/projects'>Projektverwaltung</a>
+        {nav_admin_link}
       </div>
     </div>
     """
@@ -246,6 +251,15 @@ def app(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [page.encode()]
 
+    if path == "/projects":
+        body = (
+            "<h2>Projektverwaltung</h2>"
+            "<p class='mb-0'>Projektverwaltung ist vorbereitet. Hier können als nächstes Projekte, Status und Verantwortliche verwaltet werden.</p>"
+        )
+        page = layout("Projektverwaltung", body, user)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [page.encode()]
+
     if path == "/account":
         body = (
             "<h2>Mein Account</h2>"
@@ -262,6 +276,14 @@ def app(environ, start_response):
         if user["role"] != "admin":
             return admin_only(start_response, user)
 
+        query = parse_qs(environ.get("QUERY_STRING", ""))
+        sort = query.get("sort", ["last_name"])[0]
+        direction = query.get("dir", ["asc"])[0].lower()
+        if sort not in {"first_name", "last_name", "username", "role"}:
+            sort = "last_name"
+        if direction not in {"asc", "desc"}:
+            direction = "asc"
+
         conn = sqlite3.connect(DB_PATH)
         flash = None
         if method == "POST":
@@ -276,7 +298,7 @@ def app(environ, start_response):
                         flash = {"kind": "success", "msg": f"Benutzer {target[0]} gelöscht."}
 
         users = conn.execute(
-            "SELECT id, first_name, last_name, username, role FROM users ORDER BY id ASC"
+            f"SELECT id, first_name, last_name, username, role FROM users ORDER BY {sort} {direction.upper()}, id ASC"
         ).fetchall()
         conn.close()
 
@@ -298,13 +320,21 @@ def app(environ, start_response):
                 "</tr>"
             )
 
+        headers = []
+        for col, label in (("first_name", "Vorname"), ("last_name", "Nachname"), ("username", "E-Mailadresse"), ("role", "Rolle")):
+            next_dir = "desc" if (sort == col and direction == "asc") else "asc"
+            arrow = ""
+            if sort == col:
+                arrow = " ▲" if direction == "asc" else " ▼"
+            headers.append(f"<th><a class='link-dark text-decoration-none' href='/admin/users?sort={col}&dir={next_dir}'>{label}{arrow}</a></th>")
+
         body = (
             "<div class='d-flex justify-content-between align-items-center mb-3'>"
             "<h2 class='mb-0'>Benutzerverwaltung</h2>"
             "<a class='btn btn-success' href='/admin/users/new'>Neuen Benutzer anlegen</a>"
             "</div>"
             "<div class='table-responsive'><table class='table table-striped align-middle'>"
-            "<thead><tr><th>Vorname</th><th>Nachname</th><th>E-Mailadresse</th><th>Rolle</th><th>Aktionen</th></tr></thead>"
+            f"<thead><tr>{''.join(headers)}<th>Aktionen</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
         page = layout("Benutzerverwaltung", body, user, flash)

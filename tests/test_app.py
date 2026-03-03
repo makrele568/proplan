@@ -72,18 +72,23 @@ class AppTest(unittest.TestCase):
         self.assertIn("Nur der Admin", body)
 
     def test_user_list_columns_and_actions(self):
-        cookie = self.login_and_get_cookie("admin", "admin123")
+        cookie = self.login_and_get_cookie("admin@example.com", "admin123")
         status, _, body = self.request("/admin/users", cookie=cookie)
         self.assertTrue(status.startswith("200"))
         self.assertIn("Vorname", body)
         self.assertIn("Nachname", body)
         self.assertIn("E-Mailadresse", body)
         self.assertIn("Rolle", body)
+        self.assertIn("sort=first_name", body)
+        self.assertIn("sort=last_name", body)
+        self.assertIn("sort=username", body)
+        self.assertIn("sort=role", body)
         self.assertIn("Bearbeiten", body)
         self.assertIn("Löschen", body)
+        self.assertIn("Projektverwaltung", body)
 
     def test_admin_create_edit_delete_user(self):
-        cookie = self.login_and_get_cookie("admin", "admin123")
+        cookie = self.login_and_get_cookie("admin@example.com", "admin123")
 
         status, headers, _ = self.request(
             "/admin/users/new",
@@ -132,6 +137,26 @@ class AppTest(unittest.TestCase):
         )
         self.assertTrue(status.startswith("302"))
         self.assertEqual(headers.get("Location"), "/admin/users")
+
+    def test_navigation_admin_link_hidden_for_non_admin(self):
+        conn = sqlite3.connect(proplan.DB_PATH)
+        conn.execute(
+            "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
+            ("pl@example.com", "Pia", "Leiter", "secret12", "projektleiter"),
+        )
+        conn.commit()
+        conn.close()
+
+        cookie = self.login_and_get_cookie("pl@example.com", "secret12")
+        status, _, body = self.request("/dashboard", cookie=cookie)
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Projektverwaltung", body)
+        self.assertNotIn("Benutzerverwaltung</a>", body)
+
+        status, _, body = self.request("/projects", cookie=cookie)
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Projektverwaltung", body)
+
 
 
 if __name__ == "__main__":
