@@ -55,7 +55,13 @@ class AppTest(unittest.TestCase):
         status, _, _ = self.request(
             "/register",
             "POST",
-            {"username": "alice", "password": "secret12", "role": "bearbeiter"},
+            {
+                "username": "alice",
+                "first_name": "Alice",
+                "last_name": "Muster",
+                "password": "secret12",
+                "role": "bearbeiter",
+            },
         )
         self.assertTrue(status.startswith("302"))
 
@@ -65,44 +71,43 @@ class AppTest(unittest.TestCase):
         self.assertIn("bearbeiter", body)
 
     def test_bearbeiter_forbidden_admin_area(self):
-        self.request("/register", "POST", {"username": "bob", "password": "secret12", "role": "bearbeiter"})
+        self.request(
+            "/register",
+            "POST",
+            {"username": "bob", "first_name": "Bob", "last_name": "Tester", "password": "secret12", "role": "bearbeiter"},
+        )
         cookie = self.login_and_get_cookie("bob", "secret12")
 
         status, _, body = self.request("/admin/users", cookie=cookie)
         self.assertTrue(status.startswith("403"))
-        self.assertIn("keine Berechtigung", body)
+        self.assertIn("Nur der Admin", body)
 
     def test_projektleiter_can_access_but_not_escalate_admin(self):
-        self.request("/register", "POST", {"username": "planer", "password": "secret12", "role": "projektleiter"})
+        self.request(
+            "/register",
+            "POST",
+            {
+                "username": "planer",
+                "first_name": "Petra",
+                "last_name": "Leitung",
+                "password": "secret12",
+                "role": "projektleiter",
+            },
+        )
         conn = sqlite3.connect(proplan.DB_PATH)
-        conn.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", ("worker", "x12345", "bearbeiter"))
+        conn.execute(
+            "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
+            ("worker", "Willi", "Arbeiter", "x12345", "bearbeiter"),
+        )
         conn.commit()
-        uid = conn.execute("SELECT id FROM users WHERE username='worker'").fetchone()[0]
-        admin_id = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()[0]
         conn.close()
 
         cookie = self.login_and_get_cookie("planer", "secret12")
         status, _, body = self.request("/admin/users", cookie=cookie)
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("Benutzerverwaltung", body)
+        self.assertTrue(status.startswith("403"))
+        self.assertIn("Nur der Admin", body)
 
-        status, _, body = self.request(
-            "/admin/users",
-            "POST",
-            {"action": "change_role", "user_id": str(uid), "role": "admin"},
-            cookie=cookie,
-        )
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("keine Admin-Rolle", body)
-
-        status, _, body = self.request(
-            "/admin/users",
-            "POST",
-            {"action": "delete", "user_id": str(admin_id)},
-            cookie=cookie,
-        )
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("keine Admins löschen", body)
+        # projektleiter has no access anymore, admin-only management
 
     def test_root_redirects_to_login(self):
         status, headers, _ = self.request("/")
@@ -119,15 +124,40 @@ class AppTest(unittest.TestCase):
         status, _, body = self.request("/admin/users", cookie=cookie)
         self.assertTrue(status.startswith("200"))
         self.assertIn("Neuen Benutzer hinzufügen", body)
+        self.assertIn("Bearbeiten", body)
 
         status, _, body = self.request(
             "/admin/users",
             "POST",
-            {"action": "create_user", "username": "neuuser", "password": "secret12", "role": "bearbeiter"},
+            {
+                "action": "create_user",
+                "username": "neuuser",
+                "first_name": "Neue",
+                "last_name": "Person",
+                "password": "secret12",
+                "role": "bearbeiter",
+            },
             cookie=cookie,
         )
         self.assertTrue(status.startswith("200"))
         self.assertIn("wurde angelegt", body)
+
+        status, _, body = self.request(
+            "/admin/users",
+            "POST",
+            {
+                "action": "edit_user",
+                "user_id": "2",
+                "first_name": "Neu",
+                "last_name": "Benannt",
+                "username": "neuuser",
+                "role": "bearbeiter",
+                "password": "",
+            },
+            cookie=cookie,
+        )
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("aktualisiert", body)
 
 
 if __name__ == "__main__":
