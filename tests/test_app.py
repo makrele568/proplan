@@ -150,15 +150,14 @@ class AppTest(unittest.TestCase):
 
     def test_admin_and_projektleiter_can_create_projects(self):
         admin_cookie = self.login_and_get_cookie("admin", "admin123")
-        status, _, body = self.request(
-            "/projects",
+        status, headers, _ = self.request(
+            "/projects/new",
             "POST",
             {"project_number": "P-100", "project_name": "Neubau", "project_address": "Musterstraße 1"},
             cookie=admin_cookie,
         )
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("wurde angelegt", body)
-        self.assertIn("P-100", body)
+        self.assertTrue(status.startswith("302"))
+        self.assertEqual(headers.get("Location"), "/projects")
 
         conn = sqlite3.connect(proplan.DB_PATH)
         conn.execute(
@@ -169,14 +168,14 @@ class AppTest(unittest.TestCase):
         conn.close()
 
         pl_cookie = self.login_and_get_cookie("pl", "secret12")
-        status, _, body = self.request(
-            "/projects",
+        status, headers, _ = self.request(
+            "/projects/new",
             "POST",
             {"project_number": "P-200", "project_name": "Umbau", "project_address": "Werkweg 10"},
             cookie=pl_cookie,
         )
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("P-200", body)
+        self.assertTrue(status.startswith("302"))
+        self.assertEqual(headers.get("Location"), "/projects")
 
     def test_each_user_can_create_project_and_only_owner_can_edit(self):
         conn = sqlite3.connect(proplan.DB_PATH)
@@ -192,14 +191,14 @@ class AppTest(unittest.TestCase):
         conn.close()
 
         owner_cookie = self.login_and_get_cookie("worker", "secret12")
-        status, _, body = self.request(
-            "/projects",
+        status, headers, _ = self.request(
+            "/projects/new",
             "POST",
             {"project_number": "P-300", "project_name": "Test", "project_address": "Keine 1"},
             cookie=owner_cookie,
         )
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("P-300", body)
+        self.assertTrue(status.startswith("302"))
+        self.assertEqual(headers.get("Location"), "/projects")
 
         conn = sqlite3.connect(proplan.DB_PATH)
         pid = conn.execute("SELECT id FROM projects WHERE project_number='P-300'").fetchone()[0]

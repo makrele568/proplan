@@ -296,9 +296,35 @@ def app(environ, start_response):
         return redirect(start_response, "/login")
 
     if path == "/dashboard":
+        conn = sqlite3.connect(DB_PATH)
+        projects = conn.execute(
+            """
+            SELECT DISTINCT p.id, p.project_number, p.project_name, p.project_address
+            FROM projects p
+            LEFT JOIN project_editors pe ON pe.project_id = p.id
+            WHERE p.created_by = ? OR pe.user_id = ?
+            ORDER BY p.id DESC
+            """,
+            (user["id"], user["id"]),
+        ).fetchall()
+        conn.close()
+
+        items = []
+        for pid, pnum, pname, paddr in projects:
+            items.append(
+                "<li class='list-group-item d-flex justify-content-between align-items-center'>"
+                f"<span><strong>{html.escape(pnum)}</strong> – {html.escape(pname)} <span class='text-muted'>({html.escape(paddr)})</span></span>"
+                f"<a class='btn btn-sm btn-outline-secondary' href='/projects/{pid}'>Details</a>"
+                "</li>"
+            )
+
+        items_html = ''.join(items) if items else "<li class='list-group-item text-muted'>Keine zugewiesenen Projekte.</li>"
         body = (
             f"<h2>Dashboard</h2><p>Willkommen <strong>{html.escape(user.get('first_name', ''))} {html.escape(user.get('last_name', ''))}</strong>.</p>"
-            "<p>Benutzer werden ausschließlich durch Administratoren verwaltet.</p>"
+            "<h3 class='h5 mt-4'>Meine berechtigten Projekte</h3>"
+            "<ul class='list-group'>"
+            f"{items_html}"
+            "</ul>"
         )
         page = layout("Dashboard", body, user)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
@@ -306,26 +332,6 @@ def app(environ, start_response):
 
     if path == "/projects":
         conn = sqlite3.connect(DB_PATH)
-        flash = None
-        if method == "POST":
-            form = parse_form(environ)
-            project_number = form.get("project_number", "").strip()
-            project_name = form.get("project_name", "").strip()
-            project_address = form.get("project_address", "").strip()
-
-            exists = conn.execute("SELECT id FROM projects WHERE project_number=?", (project_number,)).fetchone()
-            if len(project_number) < 2 or len(project_name) < 2 or len(project_address) < 5:
-                flash = {"kind": "warning", "msg": "Projektnummer/Projektname zu kurz oder Projektadresse ungültig."}
-            elif exists:
-                flash = {"kind": "danger", "msg": "Projektnummer ist bereits vorhanden."}
-            else:
-                conn.execute(
-                    "INSERT INTO projects (project_number, project_name, project_address, created_by) VALUES (?, ?, ?, ?)",
-                    (project_number, project_name, project_address, user["id"]),
-                )
-                conn.commit()
-                flash = {"kind": "success", "msg": f"Projekt {project_number} wurde angelegt."}
-
         projects = conn.execute(
             """
             SELECT p.id, p.project_number, p.project_name, p.project_address, p.created_at, p.created_by,
@@ -354,22 +360,57 @@ def app(environ, start_response):
             )
 
         body = (
-            "<h2 class='mb-3'>Projektverwaltung</h2>"
-            "<div class='card mb-3'><div class='card-header'>Neues Projekt anlegen</div><div class='card-body'>"
+            "<div class='d-flex justify-content-between align-items-center mb-3'>"
+            "<h2 class='mb-0'>Projektverwaltung</h2>"
+            "<a class='btn btn-success' href='/projects/new'>Neues Projekt anlegen</a>"
+            "</div>"
+            "<div class='table-responsive'><table class='table table-striped align-middle'>"
+            "<thead><tr><th>Projektnummer</th><th>Projektname</th><th>Projektadresse</th><th>Besitzer</th><th>Erstellt</th><th>Aktionen</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+            "<p class='text-muted small mt-2 mb-0'>Die interne Projekt-ID wird technisch geführt und für Berechtigungen verwendet.</p>"
+        )
+        page = layout("Projektverwaltung", body, user)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [page.encode()]
+
+    if path == "/projects/new":
+        conn = sqlite3.connect(DB_PATH)
+        if method == "POST":
+            form = parse_form(environ)
+            project_number = form.get("project_number", "").strip()
+            project_name = form.get("project_name", "").strip()
+            project_address = form.get("project_address", "").strip()
+
+            exists = conn.execute("SELECT id FROM projects WHERE project_number=?", (project_number,)).fetchone()
+            if len(project_number) < 2 or len(project_name) < 2 or len(project_address) < 5:
+                flash = {"kind": "warning", "msg": "Projektnummer/Projektname zu kurz oder Projektadresse ungültig."}
+            elif exists:
+                flash = {"kind": "danger", "msg": "Projektnummer ist bereits vorhanden."}
+            else:
+                conn.execute(
+                    "INSERT INTO projects (project_number, project_name, project_address, created_by) VALUES (?, ?, ?, ?)",
+                    (project_number, project_name, project_address, user["id"]),
+                )
+                conn.commit()
+                conn.close()
+                return redirect(start_response, "/projects")
+        else:
+            flash = None
+        conn.close()
+
+        body = (
+            "<h2>Neues Projekt anlegen</h2>"
             "<form method='post' class='row g-3'>"
             "<div class='col-md-4'><label class='form-label'>Projektnummer</label><input class='form-control' name='project_number' required></div>"
             "<div class='col-md-4'><label class='form-label'>Projektname</label><input class='form-control' name='project_name' required></div>"
             "<div class='col-md-4'><label class='form-label'>Projektadresse</label><input class='form-control' name='project_address' required></div>"
-            "<div class='col-12'><button class='btn btn-success'>Projekt speichern</button></div>"
-            "</form></div></div>"
-            "<div class='table-responsive'><table class='table table-striped align-middle'>"
-            "<thead><tr><th>Projektnummer</th><th>Projektname</th><th>Projektadresse</th><th>Besitzer</th><th>Erstellt</th><th>Aktionen</th></tr></thead>"
-            f"<tbody>{''.join(rows)}</tbody></table></div>"
-            "<p class='text-muted small mt-2 mb-0'>Die interne Projekt-ID wird technisch geführt und für Bearbeiten/Löschen verwendet.</p>"
+            "<div class='col-12 d-flex gap-2'><button class='btn btn-success'>Speichern</button><a class='btn btn-outline-secondary' href='/projects'>Zurück</a></div>"
+            "</form>"
         )
-        page = layout("Projektverwaltung", body, user, flash)
+        page = layout("Projekt anlegen", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [page.encode()]
+
 
     if path.startswith("/projects/"):
         pid = path.split("/")[-1]
@@ -492,6 +533,9 @@ def app(environ, start_response):
         options_html = ''.join(options) if options else "<option value=''>Keine verfügbaren Benutzer</option>"
         assigned_html = ''.join(assigned_rows) if assigned_rows else "<li class='list-group-item text-muted'>Keine Bearbeiter zugeordnet.</li>"
 
+        options_html = ''.join(options) if options else "<option value='' disabled>Keine verfügbaren Benutzer</option>"
+        assigned_html = ''.join(assigned_rows) if assigned_rows else "<li class='list-group-item text-muted'>Keine Bearbeiter zugeordnet.</li>"
+
         body = (
             "<h2>Projektdetails</h2>"
             "<form method='post' class='row g-3'>"
@@ -538,10 +582,10 @@ def app(environ, start_response):
             return admin_only(start_response, user)
 
         query = parse_qs(environ.get("QUERY_STRING", ""))
-        sort = query.get("sort", ["last_name"])[0]
+        sort = query.get("sort", ["role"])[0]
         direction = query.get("dir", ["asc"])[0].lower()
         if sort not in {"first_name", "last_name", "username", "email", "role"}:
-            sort = "last_name"
+            sort = "role"
         if direction not in {"asc", "desc"}:
             direction = "asc"
 
