@@ -104,6 +104,31 @@ class AppTest(unittest.TestCase):
         self.assertTrue(status.startswith("200"))
         self.assertIn("keine Admins löschen", body)
 
+    def test_root_redirects_to_login(self):
+        status, headers, _ = self.request("/")
+        self.assertTrue(status.startswith("302"))
+        self.assertEqual(headers.get("Location"), "/login")
+
+    def test_header_dropdown_and_create_user_option(self):
+        cookie = self.login_and_get_cookie("admin", "admin123")
+        status, _, body = self.request("/dashboard", cookie=cookie)
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Mein Account", body)
+        self.assertIn("Abmelden", body)
+
+        status, _, body = self.request("/admin/users", cookie=cookie)
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Neuen Benutzer hinzufügen", body)
+
+        status, _, body = self.request(
+            "/admin/users",
+            "POST",
+            {"action": "create_user", "username": "neuuser", "password": "secret12", "role": "bearbeiter"},
+            cookie=cookie,
+        )
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("wurde angelegt", body)
+
 
 if __name__ == "__main__":
     unittest.main()
