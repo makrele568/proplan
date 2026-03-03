@@ -59,6 +59,17 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_editors (
+            project_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY (project_id, user_id),
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     if "first_name" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
@@ -294,16 +305,6 @@ def app(environ, start_response):
         return [page.encode()]
 
     if path == "/projects":
-        if user["role"] not in {"admin", "projektleiter"}:
-            page = layout(
-                "Kein Zugriff",
-                "<h2>Kein Zugriff</h2><p>Nur Admin und Projektleiter können Projekte anlegen.</p>",
-                user,
-                {"kind": "danger", "msg": "Nur Admin und Projektleiter."},
-            )
-            start_response("403 Forbidden", [("Content-Type", "text/html; charset=utf-8")])
-            return [page.encode()]
-
         conn = sqlite3.connect(DB_PATH)
         flash = None
         if method == "POST":
@@ -326,18 +327,29 @@ def app(environ, start_response):
                 flash = {"kind": "success", "msg": f"Projekt {project_number} wurde angelegt."}
 
         projects = conn.execute(
-            "SELECT id, project_number, project_name, project_address, created_at FROM projects ORDER BY id DESC"
+            """
+            SELECT p.id, p.project_number, p.project_name, p.project_address, p.created_at, p.created_by,
+                   u.username
+            FROM projects p
+            JOIN users u ON u.id = p.created_by
+            ORDER BY p.id DESC
+            """
         ).fetchall()
         conn.close()
 
         rows = []
-        for _pid, pnum, pname, paddr, created in projects:
+        for pid, pnum, pname, paddr, created, owner_id, owner_username in projects:
+            actions = "<span class='text-muted'>Nur Besitzer</span>"
+            if int(owner_id) == int(user["id"]):
+                actions = f"<a class='btn btn-sm btn-outline-secondary' href='/projects/{pid}'>Bearbeiten</a>"
             rows.append(
                 "<tr>"
                 f"<td>{html.escape(pnum)}</td>"
                 f"<td>{html.escape(pname)}</td>"
                 f"<td>{html.escape(paddr)}</td>"
+                f"<td>{html.escape(owner_username)}</td>"
                 f"<td>{html.escape(created)}</td>"
+                f"<td>{actions}</td>"
                 "</tr>"
             )
 
@@ -351,11 +363,160 @@ def app(environ, start_response):
             "<div class='col-12'><button class='btn btn-success'>Projekt speichern</button></div>"
             "</form></div></div>"
             "<div class='table-responsive'><table class='table table-striped align-middle'>"
-            "<thead><tr><th>Projektnummer</th><th>Projektname</th><th>Projektadresse</th><th>Erstellt</th></tr></thead>"
+            "<thead><tr><th>Projektnummer</th><th>Projektname</th><th>Projektadresse</th><th>Besitzer</th><th>Erstellt</th><th>Aktionen</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
-            "<p class='text-muted small mt-2 mb-0'>Die interne Projekt-ID wird technisch geführt, aber nicht in der Oberfläche angezeigt.</p>"
+            "<p class='text-muted small mt-2 mb-0'>Die interne Projekt-ID wird technisch geführt und für Bearbeiten/Löschen verwendet.</p>"
         )
         page = layout("Projektverwaltung", body, user, flash)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [page.encode()]
+
+    if path.startswith("/projects/"):
+        pid = path.split("/")[-1]
+        if not pid.isdigit():
+            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+            return [b"Not found"]
+
+        conn = sqlite3.connect(DB_PATH)
+        project = conn.execute(
+            "SELECT id, project_number, project_name, project_address, created_by, created_at FROM projects WHERE id=?",
+            (pid,),
+        ).fetchone()
+        if not project:
+            conn.close()
+            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+            return [b"Not found"]
+
+        if int(project[4]) != int(user["id"]):
+            conn.close()
+            page = layout(
+                "Kein Zugriff",
+                "<h2>Kein Zugriff</h2><p>Nur der Besitzer des Projekts kann dieses Projekt bearbeiten oder löschen.</p>",
+                user,
+                {"kind": "danger", "msg": "Nur Projektbesitzer."},
+            )
+            start_response("403 Forbidden", [("Content-Type", "text/html; charset=utf-8")])
+            return [page.encode()]
+
+        flash = None
+        if method == "POST":
+            form = parse_form(environ)
+            action = form.get("action", "save")
+            if action == "delete":
+                conn.execute("DELETE FROM projects WHERE id=?", (pid,))
+                conn.execute("DELETE FROM project_editors WHERE project_id=?", (pid,))
+                conn.commit()
+                conn.close()
+                return redirect(start_response, "/projects")
+            if action == "add_editor":
+                editor_id = form.get("editor_user_id", "")
+                if editor_id.isdigit() and int(editor_id) != int(user["id"]):
+                    exists_user = conn.execute("SELECT id FROM users WHERE id=?", (editor_id,)).fetchone()
+                    if exists_user:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO project_editors (project_id, user_id) VALUES (?, ?)",
+                            (pid, editor_id),
+                        )
+                        conn.commit()
+                        flash = {"kind": "success", "msg": "Bearbeiter zugeordnet."}
+            elif action == "remove_editor":
+                editor_id = form.get("editor_user_id", "")
+                if editor_id.isdigit():
+                    conn.execute("DELETE FROM project_editors WHERE project_id=? AND user_id=?", (pid, editor_id))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Bearbeiter entfernt."}
+            else:
+                project_number = form.get("project_number", "").strip()
+                project_name = form.get("project_name", "").strip()
+                project_address = form.get("project_address", "").strip()
+                duplicate = conn.execute(
+                    "SELECT id FROM projects WHERE project_number=? AND id != ?",
+                    (project_number, pid),
+                ).fetchone()
+                if len(project_number) < 2 or len(project_name) < 2 or len(project_address) < 5:
+                    flash = {"kind": "warning", "msg": "Projektnummer/Projektname zu kurz oder Projektadresse ungültig."}
+                elif duplicate:
+                    flash = {"kind": "danger", "msg": "Projektnummer ist bereits vorhanden."}
+                else:
+                    conn.execute(
+                        "UPDATE projects SET project_number=?, project_name=?, project_address=? WHERE id=?",
+                        (project_number, project_name, project_address, pid),
+                    )
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Projekt gespeichert."}
+
+            project = conn.execute(
+                "SELECT id, project_number, project_name, project_address, created_by, created_at FROM projects WHERE id=?",
+                (pid,),
+            ).fetchone()
+
+        assigned = conn.execute(
+            """
+            SELECT u.id, u.username, u.first_name, u.last_name
+            FROM project_editors pe
+            JOIN users u ON u.id = pe.user_id
+            WHERE pe.project_id=?
+            ORDER BY u.username
+            """,
+            (pid,),
+        ).fetchall()
+        available = conn.execute(
+            """
+            SELECT id, username, first_name, last_name
+            FROM users
+            WHERE id != ? AND id NOT IN (SELECT user_id FROM project_editors WHERE project_id=?)
+            ORDER BY username
+            """,
+            (user["id"], pid),
+        ).fetchall()
+        conn.close()
+
+        assigned_rows = []
+        for uid, uname, fname, lname in assigned:
+            display = f"{fname} {lname}".strip() or uname
+            assigned_rows.append(
+                "<li class='list-group-item d-flex justify-content-between align-items-center'>"
+                f"<span>{html.escape(display)} <span class='text-muted'>({html.escape(uname)})</span></span>"
+                "<form method='post' class='mb-0'>"
+                "<input type='hidden' name='action' value='remove_editor'>"
+                f"<input type='hidden' name='editor_user_id' value='{uid}'>"
+                "<button class='btn btn-sm btn-outline-danger'>Entfernen</button>"
+                "</form></li>"
+            )
+
+        options = []
+        for uid, uname, fname, lname in available:
+            display = f"{fname} {lname}".strip() or uname
+            options.append(f"<option value='{uid}'>{html.escape(display)} ({html.escape(uname)})</option>")
+
+        options_html = ''.join(options) if options else "<option value=''>Keine verfügbaren Benutzer</option>"
+        assigned_html = ''.join(assigned_rows) if assigned_rows else "<li class='list-group-item text-muted'>Keine Bearbeiter zugeordnet.</li>"
+
+        body = (
+            "<h2>Projektdetails</h2>"
+            "<form method='post' class='row g-3'>"
+            "<input type='hidden' name='action' value='save'>"
+            f"<div class='col-md-4'><label class='form-label'>Interne Projekt-ID</label><input class='form-control' value='{project[0]}' disabled></div>"
+            f"<div class='col-md-4'><label class='form-label'>Projektnummer</label><input class='form-control' name='project_number' value='{html.escape(project[1])}' required></div>"
+            f"<div class='col-md-4'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(project[5])}' disabled></div>"
+            f"<div class='col-md-6'><label class='form-label'>Projektname</label><input class='form-control' name='project_name' value='{html.escape(project[2])}' required></div>"
+            f"<div class='col-md-6'><label class='form-label'>Projektadresse</label><input class='form-control' name='project_address' value='{html.escape(project[3])}' required></div>"
+            "<div class='col-12 d-flex gap-2'><button class='btn btn-primary'>Speichern</button></form>"
+            "<form method='post'><input type='hidden' name='action' value='delete'><button class='btn btn-danger'>Löschen</button></form>"
+            "<a class='btn btn-outline-secondary' href='/projects'>Zurück</a></div>"
+            "<hr class='my-4'>"
+            "<h3 class='h5'>Bearbeiter zuordnen</h3>"
+            "<form method='post' class='row g-2 align-items-end mb-3'>"
+            "<input type='hidden' name='action' value='add_editor'>"
+            f"<div class='col-md-8'><label class='form-label'>Benutzer</label><select class='form-select' name='editor_user_id'>{options_html}</select></div>"
+            "<div class='col-md-4'><button class='btn btn-success w-100'>Zuordnen</button></div>"
+            "</form>"
+            "<ul class='list-group'>"
+            f"{assigned_html}"
+            "</ul>"
+            "<p class='text-muted small mt-2 mb-0'>Die Zuordnung nutzt interne Benutzer-IDs.</p>"
+        )
+        page = layout("Projektdetails", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [page.encode()]
 
@@ -406,6 +567,7 @@ def app(environ, start_response):
         for uid, first_name, last_name, uname, email, role in users:
             rows.append(
                 "<tr>"
+                f"<td>{uid}</td>"
                 f"<td>{html.escape(first_name)}</td>"
                 f"<td>{html.escape(last_name)}</td>"
                 f"<td>{html.escape(uname)}</td>"
@@ -435,7 +597,7 @@ def app(environ, start_response):
             "<a class='btn btn-success' href='/admin/users/new'>Neuen Benutzer anlegen</a>"
             "</div>"
             "<div class='table-responsive'><table class='table table-striped align-middle'>"
-            f"<thead><tr>{''.join(headers)}<th>Aktionen</th></tr></thead>"
+            f"<thead><tr><th>Interne Benutzer-ID</th>{''.join(headers)}<th>Aktionen</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
         page = layout("Benutzerverwaltung", body, user, flash)
@@ -571,6 +733,7 @@ def app(environ, start_response):
         body = (
             "<h2>Benutzerdetails</h2>"
             "<form method='post' class='row g-3'>"
+            f"<div class='col-md-4'><label class='form-label'>Interne Benutzer-ID</label><input class='form-control' value='{target[0]}' disabled></div>"
             "<input type='hidden' name='action' value='save'>"
             f"<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name' value='{html.escape(target[1])}'></div>"
             f"<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name' value='{html.escape(target[2])}'></div>"

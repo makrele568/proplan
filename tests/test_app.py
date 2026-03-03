@@ -178,24 +178,52 @@ class AppTest(unittest.TestCase):
         self.assertTrue(status.startswith("200"))
         self.assertIn("P-200", body)
 
-    def test_bearbeiter_cannot_create_projects(self):
+    def test_each_user_can_create_project_and_only_owner_can_edit(self):
         conn = sqlite3.connect(proplan.DB_PATH)
         conn.execute(
             "INSERT INTO users (username, email, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?, ?)",
             ("worker", "worker@example.com", "Willi", "Worker", proplan.hash_password("secret12"), "bearbeiter"),
         )
+        conn.execute(
+            "INSERT INTO users (username, email, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?, ?)",
+            ("other", "other@example.com", "Otto", "Other", proplan.hash_password("secret12"), "bearbeiter"),
+        )
         conn.commit()
         conn.close()
 
-        cookie = self.login_and_get_cookie("worker", "secret12")
+        owner_cookie = self.login_and_get_cookie("worker", "secret12")
         status, _, body = self.request(
             "/projects",
             "POST",
             {"project_number": "P-300", "project_name": "Test", "project_address": "Keine 1"},
-            cookie=cookie,
+            cookie=owner_cookie,
         )
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("P-300", body)
+
+        conn = sqlite3.connect(proplan.DB_PATH)
+        pid = conn.execute("SELECT id FROM projects WHERE project_number='P-300'").fetchone()[0]
+        conn.close()
+
+        # owner can open project detail and assign editor
+        status, _, body = self.request(f"/projects/{pid}", cookie=owner_cookie)
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Interne Projekt-ID", body)
+
+        status, _, body = self.request(
+            f"/projects/{pid}",
+            "POST",
+            {"action": "add_editor", "editor_user_id": "3"},
+            cookie=owner_cookie,
+        )
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Bearbeiter zugeordnet", body)
+
+        # non-owner cannot edit/delete
+        other_cookie = self.login_and_get_cookie("other", "secret12")
+        status, _, body = self.request(f"/projects/{pid}", cookie=other_cookie)
         self.assertTrue(status.startswith("403"))
-        self.assertIn("Nur Admin und Projektleiter", body)
+        self.assertIn("Nur Projektbesitzer", body)
 
 
 if __name__ == "__main__":
