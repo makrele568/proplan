@@ -148,6 +148,55 @@ class AppTest(unittest.TestCase):
         self.assertTrue(status.startswith("302"))
         self.assertEqual(headers.get("Location"), "/admin/users")
 
+    def test_admin_and_projektleiter_can_create_projects(self):
+        admin_cookie = self.login_and_get_cookie("admin", "admin123")
+        status, _, body = self.request(
+            "/projects",
+            "POST",
+            {"project_number": "P-100", "project_name": "Neubau", "project_address": "Musterstraße 1"},
+            cookie=admin_cookie,
+        )
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("wurde angelegt", body)
+        self.assertIn("P-100", body)
+
+        conn = sqlite3.connect(proplan.DB_PATH)
+        conn.execute(
+            "INSERT INTO users (username, email, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?, ?)",
+            ("pl", "pl@example.com", "Petra", "Leiter", proplan.hash_password("secret12"), "projektleiter"),
+        )
+        conn.commit()
+        conn.close()
+
+        pl_cookie = self.login_and_get_cookie("pl", "secret12")
+        status, _, body = self.request(
+            "/projects",
+            "POST",
+            {"project_number": "P-200", "project_name": "Umbau", "project_address": "Werkweg 10"},
+            cookie=pl_cookie,
+        )
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("P-200", body)
+
+    def test_bearbeiter_cannot_create_projects(self):
+        conn = sqlite3.connect(proplan.DB_PATH)
+        conn.execute(
+            "INSERT INTO users (username, email, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?, ?)",
+            ("worker", "worker@example.com", "Willi", "Worker", proplan.hash_password("secret12"), "bearbeiter"),
+        )
+        conn.commit()
+        conn.close()
+
+        cookie = self.login_and_get_cookie("worker", "secret12")
+        status, _, body = self.request(
+            "/projects",
+            "POST",
+            {"project_number": "P-300", "project_name": "Test", "project_address": "Keine 1"},
+            cookie=cookie,
+        )
+        self.assertTrue(status.startswith("403"))
+        self.assertIn("Nur Admin und Projektleiter", body)
+
 
 if __name__ == "__main__":
     unittest.main()

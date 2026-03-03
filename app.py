@@ -46,6 +46,19 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_number TEXT UNIQUE NOT NULL,
+            project_name TEXT NOT NULL,
+            project_address TEXT NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(created_by) REFERENCES users(id)
+        )
+        """
+    )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     if "first_name" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
@@ -281,11 +294,68 @@ def app(environ, start_response):
         return [page.encode()]
 
     if path == "/projects":
+        if user["role"] not in {"admin", "projektleiter"}:
+            page = layout(
+                "Kein Zugriff",
+                "<h2>Kein Zugriff</h2><p>Nur Admin und Projektleiter können Projekte anlegen.</p>",
+                user,
+                {"kind": "danger", "msg": "Nur Admin und Projektleiter."},
+            )
+            start_response("403 Forbidden", [("Content-Type", "text/html; charset=utf-8")])
+            return [page.encode()]
+
+        conn = sqlite3.connect(DB_PATH)
+        flash = None
+        if method == "POST":
+            form = parse_form(environ)
+            project_number = form.get("project_number", "").strip()
+            project_name = form.get("project_name", "").strip()
+            project_address = form.get("project_address", "").strip()
+
+            exists = conn.execute("SELECT id FROM projects WHERE project_number=?", (project_number,)).fetchone()
+            if len(project_number) < 2 or len(project_name) < 2 or len(project_address) < 5:
+                flash = {"kind": "warning", "msg": "Projektnummer/Projektname zu kurz oder Projektadresse ungültig."}
+            elif exists:
+                flash = {"kind": "danger", "msg": "Projektnummer ist bereits vorhanden."}
+            else:
+                conn.execute(
+                    "INSERT INTO projects (project_number, project_name, project_address, created_by) VALUES (?, ?, ?, ?)",
+                    (project_number, project_name, project_address, user["id"]),
+                )
+                conn.commit()
+                flash = {"kind": "success", "msg": f"Projekt {project_number} wurde angelegt."}
+
+        projects = conn.execute(
+            "SELECT id, project_number, project_name, project_address, created_at FROM projects ORDER BY id DESC"
+        ).fetchall()
+        conn.close()
+
+        rows = []
+        for _pid, pnum, pname, paddr, created in projects:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(pnum)}</td>"
+                f"<td>{html.escape(pname)}</td>"
+                f"<td>{html.escape(paddr)}</td>"
+                f"<td>{html.escape(created)}</td>"
+                "</tr>"
+            )
+
         body = (
-            "<h2>Projektverwaltung</h2>"
-            "<p class='mb-0'>Projektverwaltung ist vorbereitet. Hier können als nächstes Projekte, Status und Verantwortliche verwaltet werden.</p>"
+            "<h2 class='mb-3'>Projektverwaltung</h2>"
+            "<div class='card mb-3'><div class='card-header'>Neues Projekt anlegen</div><div class='card-body'>"
+            "<form method='post' class='row g-3'>"
+            "<div class='col-md-4'><label class='form-label'>Projektnummer</label><input class='form-control' name='project_number' required></div>"
+            "<div class='col-md-4'><label class='form-label'>Projektname</label><input class='form-control' name='project_name' required></div>"
+            "<div class='col-md-4'><label class='form-label'>Projektadresse</label><input class='form-control' name='project_address' required></div>"
+            "<div class='col-12'><button class='btn btn-success'>Projekt speichern</button></div>"
+            "</form></div></div>"
+            "<div class='table-responsive'><table class='table table-striped align-middle'>"
+            "<thead><tr><th>Projektnummer</th><th>Projektname</th><th>Projektadresse</th><th>Erstellt</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+            "<p class='text-muted small mt-2 mb-0'>Die interne Projekt-ID wird technisch geführt, aber nicht in der Oberfläche angezeigt.</p>"
         )
-        page = layout("Projektverwaltung", body, user)
+        page = layout("Projektverwaltung", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [page.encode()]
 
