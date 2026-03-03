@@ -46,118 +46,93 @@ class AppTest(unittest.TestCase):
         self.assertTrue(status.startswith("302"))
         return headers.get("Set-Cookie", "").split(";", 1)[0]
 
-    def test_bootstrap_layout_visible(self):
+    def test_login_page_is_standalone(self):
         status, _, body = self.request("/login")
         self.assertTrue(status.startswith("200"))
-        self.assertIn("bootstrap", body.lower())
+        self.assertIn("<title>Login</title>", body)
+        self.assertNotIn("Navigation", body)
+        self.assertNotIn("ProPlan</a>", body)
 
-    def test_register_with_role_and_login(self):
-        status, _, _ = self.request(
-            "/register",
-            "POST",
-            {
-                "username": "alice",
-                "first_name": "Alice",
-                "last_name": "Muster",
-                "password": "secret12",
-                "role": "bearbeiter",
-            },
-        )
-        self.assertTrue(status.startswith("302"))
+    def test_register_disabled(self):
+        status, _, _ = self.request("/register")
+        self.assertTrue(status.startswith("404"))
 
-        cookie = self.login_and_get_cookie("alice", "secret12")
-        status, _, body = self.request("/dashboard", cookie=cookie)
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("bearbeiter", body)
-
-    def test_bearbeiter_forbidden_admin_area(self):
-        self.request(
-            "/register",
-            "POST",
-            {"username": "bob", "first_name": "Bob", "last_name": "Tester", "password": "secret12", "role": "bearbeiter"},
-        )
-        cookie = self.login_and_get_cookie("bob", "secret12")
-
-        status, _, body = self.request("/admin/users", cookie=cookie)
-        self.assertTrue(status.startswith("403"))
-        self.assertIn("Nur der Admin", body)
-
-    def test_projektleiter_can_access_but_not_escalate_admin(self):
-        self.request(
-            "/register",
-            "POST",
-            {
-                "username": "planer",
-                "first_name": "Petra",
-                "last_name": "Leitung",
-                "password": "secret12",
-                "role": "projektleiter",
-            },
-        )
+    def test_non_admin_forbidden_in_user_management(self):
         conn = sqlite3.connect(proplan.DB_PATH)
         conn.execute(
             "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
-            ("worker", "Willi", "Arbeiter", "x12345", "bearbeiter"),
+            ("bearb", "Bea", "Arbeiter", "secret12", "bearbeiter"),
         )
         conn.commit()
         conn.close()
 
-        cookie = self.login_and_get_cookie("planer", "secret12")
+        cookie = self.login_and_get_cookie("bearb", "secret12")
         status, _, body = self.request("/admin/users", cookie=cookie)
         self.assertTrue(status.startswith("403"))
         self.assertIn("Nur der Admin", body)
 
-        # projektleiter has no access anymore, admin-only management
-
-    def test_root_redirects_to_login(self):
-        status, headers, _ = self.request("/")
-        self.assertTrue(status.startswith("302"))
-        self.assertEqual(headers.get("Location"), "/login")
-
-    def test_header_dropdown_and_create_user_option(self):
+    def test_user_list_columns_and_actions(self):
         cookie = self.login_and_get_cookie("admin", "admin123")
-        status, _, body = self.request("/dashboard", cookie=cookie)
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("Mein Account", body)
-        self.assertIn("Abmelden", body)
-
         status, _, body = self.request("/admin/users", cookie=cookie)
         self.assertTrue(status.startswith("200"))
-        self.assertIn("Neuen Benutzer hinzufügen", body)
+        self.assertIn("Vorname", body)
+        self.assertIn("Nachname", body)
+        self.assertIn("Benutzername", body)
+        self.assertIn("Rolle", body)
+        self.assertIn("Erstellt", body)
         self.assertIn("Bearbeiten", body)
+        self.assertIn("Löschen", body)
 
-        status, _, body = self.request(
-            "/admin/users",
+    def test_admin_create_edit_delete_user(self):
+        cookie = self.login_and_get_cookie("admin", "admin123")
+
+        status, headers, _ = self.request(
+            "/admin/users/new",
             "POST",
             {
-                "action": "create_user",
-                "username": "neuuser",
-                "first_name": "Neue",
-                "last_name": "Person",
+                "first_name": "Max",
+                "last_name": "Mustermann",
+                "username": "maxm",
                 "password": "secret12",
                 "role": "bearbeiter",
             },
             cookie=cookie,
         )
+        self.assertTrue(status.startswith("302"))
+        self.assertEqual(headers.get("Location"), "/admin/users")
+
+        conn = sqlite3.connect(proplan.DB_PATH)
+        uid = conn.execute("SELECT id FROM users WHERE username='maxm'").fetchone()[0]
+        conn.close()
+
+        status, _, body = self.request(f"/admin/users/{uid}", cookie=cookie)
         self.assertTrue(status.startswith("200"))
-        self.assertIn("wurde angelegt", body)
+        self.assertIn("Benutzerdetails", body)
 
         status, _, body = self.request(
-            "/admin/users",
+            f"/admin/users/{uid}",
             "POST",
             {
-                "action": "edit_user",
-                "user_id": "2",
-                "first_name": "Neu",
-                "last_name": "Benannt",
-                "username": "neuuser",
-                "role": "bearbeiter",
+                "action": "save",
+                "first_name": "Maximilian",
+                "last_name": "Mustermann",
+                "username": "maxm",
+                "role": "projektleiter",
                 "password": "",
             },
             cookie=cookie,
         )
         self.assertTrue(status.startswith("200"))
-        self.assertIn("aktualisiert", body)
+        self.assertIn("Benutzer gespeichert", body)
+
+        status, headers, _ = self.request(
+            f"/admin/users/{uid}",
+            "POST",
+            {"action": "delete"},
+            cookie=cookie,
+        )
+        self.assertTrue(status.startswith("302"))
+        self.assertEqual(headers.get("Location"), "/admin/users")
 
 
 if __name__ == "__main__":
