@@ -1,3 +1,4 @@
+import hashlib
 import html
 import os
 import secrets
@@ -12,6 +13,23 @@ ROLES = ("admin", "projektleiter", "bearbeiter")
 ROLE_LABELS = {"admin": "Admin", "projektleiter": "Projektleiter", "bearbeiter": "Bearbeiter"}
 
 
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
+    return f"pbkdf2_sha256${salt}${digest}"
+
+
+def verify_password(stored: str, password: str) -> bool:
+    if not stored.startswith("pbkdf2_sha256$"):
+        return stored == password
+    parts = stored.split("$", 2)
+    if len(parts) != 3:
+        return False
+    _, salt, expected = parts
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
+    return secrets.compare_digest(expected, digest)
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -19,6 +37,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
             first_name TEXT NOT NULL DEFAULT '',
             last_name TEXT NOT NULL DEFAULT '',
             password TEXT NOT NULL,
@@ -32,13 +51,17 @@ def init_db():
         conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
     if "last_name" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
+    if "email" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
 
-    existing = conn.execute("SELECT id FROM users WHERE username='admin@example.com'").fetchone()
+    existing = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
     if not existing:
         conn.execute(
-            "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
-            ("admin@example.com", "System", "Admin", "admin123", "admin"),
+            "INSERT INTO users (username, email, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?, ?)",
+            ("admin", "admin@example.com", "System", "Admin", hash_password("admin123"), "admin"),
         )
+    else:
+        conn.execute("UPDATE users SET email = COALESCE(NULLIF(email, ''), ?) WHERE username='admin'", ("admin@example.com",))
     conn.commit()
     conn.close()
 
@@ -95,8 +118,8 @@ def login_page(flash=None):
             {flash_html}
             <form method='post' class='row g-3'>
               <div class='col-12'>
-                <label class='form-label'>E-Mailadresse</label>
-                <input class='form-control' name='username' type='email' required>
+                <label class='form-label'>Benutzername</label>
+                <input class='form-control' name='username' required>
               </div>
               <div class='col-12'>
                 <label class='form-label'>Passwort</label>
@@ -213,20 +236,26 @@ def app(environ, start_response):
             form = parse_form(environ)
             conn = sqlite3.connect(DB_PATH)
             row = conn.execute(
-                "SELECT id, username, first_name, last_name, role FROM users WHERE username=? AND password=?",
-                (form.get("username", ""), form.get("password", "")),
+                "SELECT id, username, email, first_name, last_name, password, role FROM users WHERE username=?",
+                (form.get("username", ""),),
             ).fetchone()
-            conn.close()
-            if row:
+            if row and verify_password(row[5], form.get("password", "")):
+                # transparently upgrade legacy plain-text password
+                if not str(row[5]).startswith("pbkdf2_sha256$"):
+                    conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(form.get("password", "")), row[0]))
+                    conn.commit()
+                conn.close()
                 newsid = secrets.token_hex(16)
                 SESSIONS[newsid] = {
                     "id": row[0],
                     "username": row[1],
-                    "first_name": row[2],
-                    "last_name": row[3],
-                    "role": row[4],
+                    "email": row[2],
+                    "first_name": row[3],
+                    "last_name": row[4],
+                    "role": row[6],
                 }
                 return redirect(start_response, "/dashboard", sid=newsid)
+            conn.close()
             page = login_page({"kind": "danger", "msg": "Ungültige Zugangsdaten."})
         else:
             page = login_page()
@@ -265,7 +294,8 @@ def app(environ, start_response):
             "<h2>Mein Account</h2>"
             f"<p><strong>Vorname:</strong> {html.escape(user.get('first_name', ''))}</p>"
             f"<p><strong>Nachname:</strong> {html.escape(user.get('last_name', ''))}</p>"
-            f"<p><strong>E-Mailadresse:</strong> {html.escape(user['username'])}</p>"
+            f"<p><strong>Benutzername:</strong> {html.escape(user['username'])}</p>"
+            f"<p><strong>E-Mailadresse:</strong> {html.escape(user.get('email', ''))}</p>"
             f"<p><strong>Rolle:</strong> {role_badge(user['role'])}</p>"
         )
         page = layout("Mein Account", body, user)
@@ -279,7 +309,7 @@ def app(environ, start_response):
         query = parse_qs(environ.get("QUERY_STRING", ""))
         sort = query.get("sort", ["last_name"])[0]
         direction = query.get("dir", ["asc"])[0].lower()
-        if sort not in {"first_name", "last_name", "username", "role"}:
+        if sort not in {"first_name", "last_name", "username", "email", "role"}:
             sort = "last_name"
         if direction not in {"asc", "desc"}:
             direction = "asc"
@@ -298,17 +328,18 @@ def app(environ, start_response):
                         flash = {"kind": "success", "msg": f"Benutzer {target[0]} gelöscht."}
 
         users = conn.execute(
-            f"SELECT id, first_name, last_name, username, role FROM users ORDER BY {sort} {direction.upper()}, id ASC"
+            f"SELECT id, first_name, last_name, username, email, role FROM users ORDER BY {sort} {direction.upper()}, id ASC"
         ).fetchall()
         conn.close()
 
         rows = []
-        for uid, first_name, last_name, uname, role in users:
+        for uid, first_name, last_name, uname, email, role in users:
             rows.append(
                 "<tr>"
                 f"<td>{html.escape(first_name)}</td>"
                 f"<td>{html.escape(last_name)}</td>"
                 f"<td>{html.escape(uname)}</td>"
+                f"<td>{html.escape(email)}</td>"
                 f"<td>{role_badge(role)}</td>"
                 "<td><div class='d-flex gap-2'>"
                 f"<a class='btn btn-sm btn-outline-secondary' href='/admin/users/{uid}'>Bearbeiten</a>"
@@ -321,7 +352,7 @@ def app(environ, start_response):
             )
 
         headers = []
-        for col, label in (("first_name", "Vorname"), ("last_name", "Nachname"), ("username", "E-Mailadresse"), ("role", "Rolle")):
+        for col, label in (("first_name", "Vorname"), ("last_name", "Nachname"), ("username", "Benutzername"), ("email", "E-Mailadresse"), ("role", "Rolle")):
             next_dir = "desc" if (sort == col and direction == "asc") else "asc"
             arrow = ""
             if sort == col:
@@ -351,20 +382,24 @@ def app(environ, start_response):
             first_name = form.get("first_name", "").strip()
             last_name = form.get("last_name", "").strip()
             username = form.get("username", "").strip()
+            email = form.get("email", "").strip()
             password = form.get("password", "")
             role = form.get("role", "bearbeiter")
             if role not in ROLES:
                 role = "bearbeiter"
-            exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+            exists_user = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+            exists_email = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
 
-            if "@" not in username or len(password) < 6:
-                flash = {"kind": "warning", "msg": "E-Mailadresse ungültig oder Passwort zu kurz (>=6)."}
-            elif exists:
+            if len(username) < 3 or "@" not in email or len(password) < 6:
+                flash = {"kind": "warning", "msg": "Benutzername >=3, gültige E-Mailadresse und Passwort >=6 erforderlich."}
+            elif exists_user:
                 flash = {"kind": "danger", "msg": "Benutzername bereits vergeben."}
+            elif exists_email:
+                flash = {"kind": "danger", "msg": "E-Mailadresse bereits vergeben."}
             else:
                 conn.execute(
-                    "INSERT INTO users (first_name, last_name, username, password, role) VALUES (?, ?, ?, ?, ?)",
-                    (first_name, last_name, username, password, role),
+                    "INSERT INTO users (first_name, last_name, username, email, password, role) VALUES (?, ?, ?, ?, ?, ?)",
+                    (first_name, last_name, username, email, hash_password(password), role),
                 )
                 conn.commit()
                 conn.close()
@@ -379,8 +414,9 @@ def app(environ, start_response):
             "<form method='post' class='row g-3'>"
             "<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name'></div>"
             "<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name'></div>"
-            "<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='username' type='email' required></div>"
-            "<div class='col-md-6'><label class='form-label'>Passwort</label><input class='form-control' name='password' required minlength='6'></div>"
+            "<div class='col-md-6'><label class='form-label'>Benutzername</label><input class='form-control' name='username' required></div>"
+            "<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='email' type='email' required></div>"
+            "<div class='col-md-6'><label class='form-label'>Passwort</label><input class='form-control' type='password' name='password' required minlength='6'></div>"
             f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{options}</select></div>"
             "<div class='col-12 d-flex gap-2'><button class='btn btn-success'>Speichern</button><a class='btn btn-outline-secondary' href='/admin/users'>Zurück</a></div>"
             "</form>"
@@ -400,7 +436,7 @@ def app(environ, start_response):
 
         conn = sqlite3.connect(DB_PATH)
         target = conn.execute(
-            "SELECT id, first_name, last_name, username, role, created_at FROM users WHERE id=?",
+            "SELECT id, first_name, last_name, username, email, role, created_at FROM users WHERE id=?",
             (uid,),
         ).fetchone()
         if not target:
@@ -424,49 +460,55 @@ def app(environ, start_response):
                 first_name = form.get("first_name", "").strip()
                 last_name = form.get("last_name", "").strip()
                 username = form.get("username", "").strip()
-                role = form.get("role", target[4])
+                email = form.get("email", "").strip()
+                role = form.get("role", target[5])
                 password = form.get("password", "")
                 if role not in ROLES:
-                    role = target[4]
-                existing_name = conn.execute("SELECT id FROM users WHERE username=? AND id != ?", (username, uid)).fetchone()
+                    role = target[5]
 
-                if "@" not in username:
-                    flash = {"kind": "warning", "msg": "Bitte gültige E-Mailadresse angeben."}
+                existing_name = conn.execute("SELECT id FROM users WHERE username=? AND id != ?", (username, uid)).fetchone()
+                existing_email = conn.execute("SELECT id FROM users WHERE email=? AND id != ?", (email, uid)).fetchone()
+
+                if len(username) < 3 or "@" not in email:
+                    flash = {"kind": "warning", "msg": "Benutzername >=3 und gültige E-Mailadresse erforderlich."}
                 elif existing_name:
                     flash = {"kind": "danger", "msg": "Benutzername bereits vergeben."}
+                elif existing_email:
+                    flash = {"kind": "danger", "msg": "E-Mailadresse bereits vergeben."}
                 elif password and len(password) < 6:
                     flash = {"kind": "warning", "msg": "Neues Passwort muss mindestens 6 Zeichen haben."}
                 else:
                     if password:
                         conn.execute(
-                            "UPDATE users SET first_name=?, last_name=?, username=?, role=?, password=? WHERE id=?",
-                            (first_name, last_name, username, role, password, uid),
+                            "UPDATE users SET first_name=?, last_name=?, username=?, email=?, role=?, password=? WHERE id=?",
+                            (first_name, last_name, username, email, role, hash_password(password), uid),
                         )
                     else:
                         conn.execute(
-                            "UPDATE users SET first_name=?, last_name=?, username=?, role=? WHERE id=?",
-                            (first_name, last_name, username, role, uid),
+                            "UPDATE users SET first_name=?, last_name=?, username=?, email=?, role=? WHERE id=?",
+                            (first_name, last_name, username, email, role, uid),
                         )
                     conn.commit()
                     flash = {"kind": "success", "msg": "Benutzer gespeichert."}
 
             target = conn.execute(
-                "SELECT id, first_name, last_name, username, role, created_at FROM users WHERE id=?",
+                "SELECT id, first_name, last_name, username, email, role, created_at FROM users WHERE id=?",
                 (uid,),
             ).fetchone()
 
         conn.close()
-        options = "".join([f"<option value='{r}' {'selected' if r == target[4] else ''}>{ROLE_LABELS.get(r, r)}</option>" for r in ROLES])
+        options = "".join([f"<option value='{r}' {'selected' if r == target[5] else ''}>{ROLE_LABELS.get(r, r)}</option>" for r in ROLES])
         body = (
             "<h2>Benutzerdetails</h2>"
             "<form method='post' class='row g-3'>"
             "<input type='hidden' name='action' value='save'>"
             f"<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name' value='{html.escape(target[1])}'></div>"
             f"<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name' value='{html.escape(target[2])}'></div>"
-            f"<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='username' type='email' value='{html.escape(target[3])}' required></div>"
+            f"<div class='col-md-6'><label class='form-label'>Benutzername</label><input class='form-control' name='username' value='{html.escape(target[3])}' required></div>"
+            f"<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='email' type='email' value='{html.escape(target[4])}' required></div>"
             f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{options}</select></div>"
-            "<div class='col-md-6'><label class='form-label'>Neues Passwort (optional)</label><input class='form-control' name='password'></div>"
-            f"<div class='col-md-6'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(target[5])}' disabled></div>"
+            "<div class='col-md-6'><label class='form-label'>Neues Passwort (optional)</label><input class='form-control' type='password' name='password'></div>"
+            f"<div class='col-md-6'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(target[6])}' disabled></div>"
             "<div class='col-12 d-flex gap-2'>"
             "<button class='btn btn-primary'>Speichern</button>"
             "</form>"

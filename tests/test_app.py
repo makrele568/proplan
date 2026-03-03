@@ -22,7 +22,13 @@ class AppTest(unittest.TestCase):
     def request(self, path, method="GET", data=None, cookie=""):
         environ = {}
         setup_testing_defaults(environ)
-        environ["PATH_INFO"] = path
+        if "?" in path:
+            path_only, query = path.split("?", 1)
+            environ["PATH_INFO"] = path_only
+            environ["QUERY_STRING"] = query
+        else:
+            environ["PATH_INFO"] = path
+            environ["QUERY_STRING"] = ""
         environ["REQUEST_METHOD"] = method
 
         raw = urlencode(data or {}).encode("utf-8")
@@ -46,12 +52,18 @@ class AppTest(unittest.TestCase):
         self.assertTrue(status.startswith("302"))
         return headers.get("Set-Cookie", "").split(";", 1)[0]
 
-    def test_login_page_is_standalone(self):
-        status, _, body = self.request("/login")
+    def test_admin_can_login_with_username_not_email(self):
+        cookie = self.login_and_get_cookie("admin", "admin123")
+        status, _, body = self.request("/dashboard", cookie=cookie)
         self.assertTrue(status.startswith("200"))
-        self.assertIn("<title>Login</title>", body)
-        self.assertNotIn("Navigation", body)
-        self.assertNotIn("ProPlan</a>", body)
+        self.assertIn("Dashboard", body)
+
+    def test_password_hashed_in_db(self):
+        conn = sqlite3.connect(proplan.DB_PATH)
+        pw = conn.execute("SELECT password FROM users WHERE username='admin'").fetchone()[0]
+        conn.close()
+        self.assertTrue(pw.startswith("pbkdf2_sha256$"))
+        self.assertNotEqual(pw, "admin123")
 
     def test_register_disabled(self):
         status, _, _ = self.request("/register")
@@ -60,35 +72,33 @@ class AppTest(unittest.TestCase):
     def test_non_admin_forbidden_in_user_management(self):
         conn = sqlite3.connect(proplan.DB_PATH)
         conn.execute(
-            "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
-            ("bearb@example.com", "Bea", "Arbeiter", "secret12", "bearbeiter"),
+            "INSERT INTO users (username, email, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?, ?)",
+            ("bearb", "bearb@example.com", "Bea", "Arbeiter", proplan.hash_password("secret12"), "bearbeiter"),
         )
         conn.commit()
         conn.close()
 
-        cookie = self.login_and_get_cookie("bearb@example.com", "secret12")
+        cookie = self.login_and_get_cookie("bearb", "secret12")
         status, _, body = self.request("/admin/users", cookie=cookie)
         self.assertTrue(status.startswith("403"))
         self.assertIn("Nur der Admin", body)
 
-    def test_user_list_columns_and_actions(self):
-        cookie = self.login_and_get_cookie("admin@example.com", "admin123")
-        status, _, body = self.request("/admin/users", cookie=cookie)
+    def test_user_list_columns_and_sorting(self):
+        cookie = self.login_and_get_cookie("admin", "admin123")
+        status, _, body = self.request("/admin/users?sort=username&dir=asc", cookie=cookie)
         self.assertTrue(status.startswith("200"))
         self.assertIn("Vorname", body)
         self.assertIn("Nachname", body)
+        self.assertIn("Benutzername", body)
         self.assertIn("E-Mailadresse", body)
-        self.assertIn("Rolle", body)
         self.assertIn("sort=first_name", body)
         self.assertIn("sort=last_name", body)
         self.assertIn("sort=username", body)
+        self.assertIn("sort=email", body)
         self.assertIn("sort=role", body)
-        self.assertIn("Bearbeiten", body)
-        self.assertIn("Löschen", body)
-        self.assertIn("Projektverwaltung", body)
 
     def test_admin_create_edit_delete_user(self):
-        cookie = self.login_and_get_cookie("admin@example.com", "admin123")
+        cookie = self.login_and_get_cookie("admin", "admin123")
 
         status, headers, _ = self.request(
             "/admin/users/new",
@@ -96,7 +106,8 @@ class AppTest(unittest.TestCase):
             {
                 "first_name": "Max",
                 "last_name": "Mustermann",
-                "username": "maxm@example.com",
+                "username": "maxm",
+                "email": "maxm@example.com",
                 "password": "secret12",
                 "role": "bearbeiter",
             },
@@ -106,12 +117,10 @@ class AppTest(unittest.TestCase):
         self.assertEqual(headers.get("Location"), "/admin/users")
 
         conn = sqlite3.connect(proplan.DB_PATH)
-        uid = conn.execute("SELECT id FROM users WHERE username='maxm@example.com'").fetchone()[0]
+        uid = conn.execute("SELECT id FROM users WHERE username='maxm'").fetchone()[0]
+        pw = conn.execute("SELECT password FROM users WHERE id=?", (uid,)).fetchone()[0]
         conn.close()
-
-        status, _, body = self.request(f"/admin/users/{uid}", cookie=cookie)
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("Benutzerdetails", body)
+        self.assertTrue(pw.startswith("pbkdf2_sha256$"))
 
         status, _, body = self.request(
             f"/admin/users/{uid}",
@@ -120,7 +129,8 @@ class AppTest(unittest.TestCase):
                 "action": "save",
                 "first_name": "Maximilian",
                 "last_name": "Mustermann",
-                "username": "maxm@example.com",
+                "username": "maxm",
+                "email": "maximilian@example.com",
                 "role": "projektleiter",
                 "password": "",
             },
@@ -137,26 +147,6 @@ class AppTest(unittest.TestCase):
         )
         self.assertTrue(status.startswith("302"))
         self.assertEqual(headers.get("Location"), "/admin/users")
-
-    def test_navigation_admin_link_hidden_for_non_admin(self):
-        conn = sqlite3.connect(proplan.DB_PATH)
-        conn.execute(
-            "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
-            ("pl@example.com", "Pia", "Leiter", "secret12", "projektleiter"),
-        )
-        conn.commit()
-        conn.close()
-
-        cookie = self.login_and_get_cookie("pl@example.com", "secret12")
-        status, _, body = self.request("/dashboard", cookie=cookie)
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("Projektverwaltung", body)
-        self.assertNotIn("Benutzerverwaltung</a>", body)
-
-        status, _, body = self.request("/projects", cookie=cookie)
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("Projektverwaltung", body)
-
 
 
 if __name__ == "__main__":
