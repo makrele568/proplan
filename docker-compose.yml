@@ -1,0 +1,13 @@
+services:
+  proplan:
+    build: .
+    container_name: proplan
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    environment:
+      - PORT=5050
+      - DATABASE_PATH=/data/proplan.sqlite
+    volumes:
+      # Synology-Pfad anpassen, z. B. /volume1/docker/proplan/db
+      - /volume1/docker/proplan/db:/data
