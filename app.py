@@ -9,6 +9,7 @@ from wsgiref.simple_server import make_server
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "proplan.sqlite"))
 SESSIONS = {}
 ROLES = ("admin", "projektleiter", "bearbeiter")
+ROLE_LABELS = {"admin": "Admin", "projektleiter": "Projektleiter", "bearbeiter": "Bearbeiter"}
 
 
 def init_db():
@@ -69,7 +70,7 @@ def redirect(start_response, location, sid=None):
 
 def role_badge(role):
     mapping = {"admin": "danger", "projektleiter": "warning text-dark", "bearbeiter": "primary"}
-    return f"<span class='badge bg-{mapping.get(role, 'secondary')}'>{html.escape(role)}</span>"
+    return f"<span class='badge bg-{mapping.get(role, 'secondary')}'>{html.escape(ROLE_LABELS.get(role, role))}</span>"
 
 
 def login_page(flash=None):
@@ -94,8 +95,8 @@ def login_page(flash=None):
             {flash_html}
             <form method='post' class='row g-3'>
               <div class='col-12'>
-                <label class='form-label'>Benutzername</label>
-                <input class='form-control' name='username' required>
+                <label class='form-label'>E-Mailadresse</label>
+                <input class='form-control' name='username' type='email' required>
               </div>
               <div class='col-12'>
                 <label class='form-label'>Passwort</label>
@@ -250,7 +251,7 @@ def app(environ, start_response):
             "<h2>Mein Account</h2>"
             f"<p><strong>Vorname:</strong> {html.escape(user.get('first_name', ''))}</p>"
             f"<p><strong>Nachname:</strong> {html.escape(user.get('last_name', ''))}</p>"
-            f"<p><strong>Benutzername:</strong> {html.escape(user['username'])}</p>"
+            f"<p><strong>E-Mailadresse:</strong> {html.escape(user['username'])}</p>"
             f"<p><strong>Rolle:</strong> {role_badge(user['role'])}</p>"
         )
         page = layout("Mein Account", body, user)
@@ -275,19 +276,18 @@ def app(environ, start_response):
                         flash = {"kind": "success", "msg": f"Benutzer {target[0]} gelöscht."}
 
         users = conn.execute(
-            "SELECT id, first_name, last_name, username, role, created_at FROM users ORDER BY id ASC"
+            "SELECT id, first_name, last_name, username, role FROM users ORDER BY id ASC"
         ).fetchall()
         conn.close()
 
         rows = []
-        for uid, first_name, last_name, uname, role, created in users:
+        for uid, first_name, last_name, uname, role in users:
             rows.append(
                 "<tr>"
                 f"<td>{html.escape(first_name)}</td>"
                 f"<td>{html.escape(last_name)}</td>"
                 f"<td>{html.escape(uname)}</td>"
                 f"<td>{role_badge(role)}</td>"
-                f"<td>{html.escape(created)}</td>"
                 "<td><div class='d-flex gap-2'>"
                 f"<a class='btn btn-sm btn-outline-secondary' href='/admin/users/{uid}'>Bearbeiten</a>"
                 "<form method='post'>"
@@ -304,7 +304,7 @@ def app(environ, start_response):
             "<a class='btn btn-success' href='/admin/users/new'>Neuen Benutzer anlegen</a>"
             "</div>"
             "<div class='table-responsive'><table class='table table-striped align-middle'>"
-            "<thead><tr><th>Vorname</th><th>Nachname</th><th>Benutzername</th><th>Rolle</th><th>Erstellt</th><th>Aktionen</th></tr></thead>"
+            "<thead><tr><th>Vorname</th><th>Nachname</th><th>E-Mailadresse</th><th>Rolle</th><th>Aktionen</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
         )
         page = layout("Benutzerverwaltung", body, user, flash)
@@ -327,8 +327,8 @@ def app(environ, start_response):
                 role = "bearbeiter"
             exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
 
-            if len(first_name) < 2 or len(last_name) < 2 or len(username) < 3 or len(password) < 6:
-                flash = {"kind": "warning", "msg": "Vorname/Nachname >=2, Benutzername >=3, Passwort >=6."}
+            if "@" not in username or len(password) < 6:
+                flash = {"kind": "warning", "msg": "E-Mailadresse ungültig oder Passwort zu kurz (>=6)."}
             elif exists:
                 flash = {"kind": "danger", "msg": "Benutzername bereits vergeben."}
             else:
@@ -343,13 +343,13 @@ def app(environ, start_response):
             flash = None
         conn.close()
 
-        options = "".join([f"<option value='{r}'>{r}</option>" for r in ROLES])
+        options = "".join([f"<option value='{r}'>{ROLE_LABELS.get(r, r)}</option>" for r in ROLES])
         body = (
             "<h2>Neuen Benutzer anlegen</h2>"
             "<form method='post' class='row g-3'>"
-            "<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name' required minlength='2'></div>"
-            "<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name' required minlength='2'></div>"
-            "<div class='col-md-6'><label class='form-label'>Benutzername</label><input class='form-control' name='username' required minlength='3'></div>"
+            "<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name'></div>"
+            "<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name'></div>"
+            "<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='username' type='email' required></div>"
             "<div class='col-md-6'><label class='form-label'>Passwort</label><input class='form-control' name='password' required minlength='6'></div>"
             f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{options}</select></div>"
             "<div class='col-12 d-flex gap-2'><button class='btn btn-success'>Speichern</button><a class='btn btn-outline-secondary' href='/admin/users'>Zurück</a></div>"
@@ -400,8 +400,8 @@ def app(environ, start_response):
                     role = target[4]
                 existing_name = conn.execute("SELECT id FROM users WHERE username=? AND id != ?", (username, uid)).fetchone()
 
-                if len(first_name) < 2 or len(last_name) < 2 or len(username) < 3:
-                    flash = {"kind": "warning", "msg": "Vorname/Nachname >=2 und Benutzername >=3."}
+                if "@" not in username:
+                    flash = {"kind": "warning", "msg": "Bitte gültige E-Mailadresse angeben."}
                 elif existing_name:
                     flash = {"kind": "danger", "msg": "Benutzername bereits vergeben."}
                 elif password and len(password) < 6:
@@ -426,14 +426,14 @@ def app(environ, start_response):
             ).fetchone()
 
         conn.close()
-        options = "".join([f"<option value='{r}' {'selected' if r == target[4] else ''}>{r}</option>" for r in ROLES])
+        options = "".join([f"<option value='{r}' {'selected' if r == target[4] else ''}>{ROLE_LABELS.get(r, r)}</option>" for r in ROLES])
         body = (
             "<h2>Benutzerdetails</h2>"
             "<form method='post' class='row g-3'>"
             "<input type='hidden' name='action' value='save'>"
-            f"<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name' value='{html.escape(target[1])}' required></div>"
-            f"<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name' value='{html.escape(target[2])}' required></div>"
-            f"<div class='col-md-6'><label class='form-label'>Benutzername</label><input class='form-control' name='username' value='{html.escape(target[3])}' required></div>"
+            f"<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name' value='{html.escape(target[1])}'></div>"
+            f"<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name' value='{html.escape(target[2])}'></div>"
+            f"<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='username' type='email' value='{html.escape(target[3])}' required></div>"
             f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{options}</select></div>"
             "<div class='col-md-6'><label class='form-label'>Neues Passwort (optional)</label><input class='form-control' name='password'></div>"
             f"<div class='col-md-6'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(target[5])}' disabled></div>"

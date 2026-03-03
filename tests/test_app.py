@@ -61,12 +61,12 @@ class AppTest(unittest.TestCase):
         conn = sqlite3.connect(proplan.DB_PATH)
         conn.execute(
             "INSERT INTO users (username, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?)",
-            ("bearb", "Bea", "Arbeiter", "secret12", "bearbeiter"),
+            ("bearb@example.com", "Bea", "Arbeiter", "secret12", "bearbeiter"),
         )
         conn.commit()
         conn.close()
 
-        cookie = self.login_and_get_cookie("bearb", "secret12")
+        cookie = self.login_and_get_cookie("bearb@example.com", "secret12")
         status, _, body = self.request("/admin/users", cookie=cookie)
         self.assertTrue(status.startswith("403"))
         self.assertIn("Nur der Admin", body)
@@ -77,9 +77,8 @@ class AppTest(unittest.TestCase):
         self.assertTrue(status.startswith("200"))
         self.assertIn("Vorname", body)
         self.assertIn("Nachname", body)
-        self.assertIn("Benutzername", body)
+        self.assertIn("E-Mailadresse", body)
         self.assertIn("Rolle", body)
-        self.assertIn("Erstellt", body)
         self.assertIn("Bearbeiten", body)
         self.assertIn("Löschen", body)
 
@@ -92,7 +91,7 @@ class AppTest(unittest.TestCase):
             {
                 "first_name": "Max",
                 "last_name": "Mustermann",
-                "username": "maxm",
+                "username": "maxm@example.com",
                 "password": "secret12",
                 "role": "bearbeiter",
             },
@@ -102,7 +101,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(headers.get("Location"), "/admin/users")
 
         conn = sqlite3.connect(proplan.DB_PATH)
-        uid = conn.execute("SELECT id FROM users WHERE username='maxm'").fetchone()[0]
+        uid = conn.execute("SELECT id FROM users WHERE username='maxm@example.com'").fetchone()[0]
         conn.close()
 
         status, _, body = self.request(f"/admin/users/{uid}", cookie=cookie)
@@ -116,7 +115,7 @@ class AppTest(unittest.TestCase):
                 "action": "save",
                 "first_name": "Maximilian",
                 "last_name": "Mustermann",
-                "username": "maxm",
+                "username": "maxm@example.com",
                 "role": "projektleiter",
                 "password": "",
             },
