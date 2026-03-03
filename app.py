@@ -30,24 +30,28 @@ def verify_password(stored: str, password: str) -> bool:
     return secrets.compare_digest(expected, digest)
 
 
-def init_db():
+def db_connect():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    conn = db_connect()
+    conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            email TEXT NOT NULL DEFAULT '',
+            email TEXT UNIQUE NOT NULL,
             first_name TEXT NOT NULL DEFAULT '',
             last_name TEXT NOT NULL DEFAULT '',
             password TEXT NOT NULL,
             role TEXT NOT NULL CHECK(role IN ('admin', 'projektleiter', 'bearbeiter')),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        """
+        );
+
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_number TEXT UNIQUE NOT NULL,
@@ -55,31 +59,43 @@ def init_db():
             project_address TEXT NOT NULL,
             created_by INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(created_by) REFERENCES users(id)
-        )
-        """
-    )
-    conn.execute(
-        """
+            FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE RESTRICT
+        );
+
         CREATE TABLE IF NOT EXISTS project_editors (
             project_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             PRIMARY KEY (project_id, user_id),
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
+        );
+
+        CREATE TABLE IF NOT EXISTS project_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            address TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS project_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
         """
     )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-    if "first_name" not in columns:
-        conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''")
-    if "last_name" not in columns:
-        conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
-    if "email" not in columns:
+
+    user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "email" not in user_cols:
         conn.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
 
-    existing = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
-    if not existing:
+    admin = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
+    if not admin:
         conn.execute(
             "INSERT INTO users (username, email, first_name, last_name, password, role) VALUES (?, ?, ?, ?, ?, ?)",
             ("admin", "admin@example.com", "System", "Admin", hash_password("admin123"), "admin"),
@@ -91,10 +107,9 @@ def init_db():
 
 
 def parse_cookies(environ):
-    raw = environ.get("HTTP_COOKIE", "")
     c = cookies.SimpleCookie()
-    c.load(raw)
-    return {k: morsel.value for k, morsel in c.items()}
+    c.load(environ.get("HTTP_COOKIE", ""))
+    return {k: m.value for k, m in c.items()}
 
 
 def parse_form(environ):
@@ -102,9 +117,9 @@ def parse_form(environ):
         size = int(environ.get("CONTENT_LENGTH", "0"))
     except ValueError:
         size = 0
-    data = environ["wsgi.input"].read(size).decode("utf-8")
-    form = parse_qs(data)
-    return {k: v[0] for k, v in form.items()}
+    raw = environ["wsgi.input"].read(size).decode("utf-8")
+    parsed = parse_qs(raw)
+    return {k: v[0] for k, v in parsed.items()}
 
 
 def redirect(start_response, location, sid=None):
@@ -116,137 +131,75 @@ def redirect(start_response, location, sid=None):
 
 
 def role_badge(role):
-    mapping = {"admin": "danger", "projektleiter": "warning text-dark", "bearbeiter": "primary"}
-    return f"<span class='badge bg-{mapping.get(role, 'secondary')}'>{html.escape(ROLE_LABELS.get(role, role))}</span>"
+    style = {"admin": "danger", "projektleiter": "warning text-dark", "bearbeiter": "primary"}.get(role, "secondary")
+    return f"<span class='badge bg-{style}'>{html.escape(ROLE_LABELS.get(role, role))}</span>"
 
 
 def login_page(flash=None):
-    flash_html = ""
-    if flash:
-        flash_html = f"<div class='alert alert-{flash.get('kind', 'info')}'>{html.escape(flash.get('msg', ''))}</div>"
-    return f"""<!doctype html>
-<html lang='de'>
-<head>
-  <meta charset='utf-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>Login</title>
-  <link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>
-</head>
-<body class='bg-light'>
-  <div class='container py-5'>
-    <div class='row justify-content-center'>
-      <div class='col-md-5'>
-        <div class='card shadow-sm'>
-          <div class='card-body'>
-            <h2 class='mb-3'>Login</h2>
-            {flash_html}
-            <form method='post' class='row g-3'>
-              <div class='col-12'>
-                <label class='form-label'>Benutzername</label>
-                <input class='form-control' name='username' required>
-              </div>
-              <div class='col-12'>
-                <label class='form-label'>Passwort</label>
-                <input class='form-control' type='password' name='password' required>
-              </div>
-              <div class='col-12'><button class='btn btn-success w-100'>Anmelden</button></div>
-            </form>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</body>
-</html>"""
+    flash_html = f"<div class='alert alert-{flash['kind']}'>{html.escape(flash['msg'])}</div>" if flash else ""
+    return f"""<!doctype html><html lang='de'><head>
+    <meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+    <title>Login</title><link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>
+    </head><body class='bg-light'>
+    <div class='container py-5'><div class='row justify-content-center'><div class='col-md-5'><div class='card shadow-sm'><div class='card-body'>
+      <h2 class='mb-3'>Login</h2>{flash_html}
+      <form method='post' class='row g-3'>
+        <div class='col-12'><label class='form-label'>Benutzername</label><input class='form-control' name='username' required></div>
+        <div class='col-12'><label class='form-label'>Passwort</label><input class='form-control' type='password' name='password' required></div>
+        <div class='col-12'><button class='btn btn-success w-100'>Anmelden</button></div>
+      </form>
+    </div></div></div></div></div></body></html>"""
 
 
 def layout(title, content, user, flash=None):
-    user_name = html.escape(user["username"])
-    full_name = f"{html.escape(user.get('first_name', ''))} {html.escape(user.get('last_name', ''))}".strip()
-
-    flash_html = ""
-    if flash:
-        flash_html = f"<div class='alert alert-{flash.get('kind', 'info')}'>{html.escape(flash.get('msg', ''))}</div>"
-
-    nav_admin_link = ""
-    if user.get("role") == "admin":
-        nav_admin_link = "<a class='list-group-item list-group-item-action' href='/admin/users'>Benutzerverwaltung</a>"
-
-    left_col = f"""
-    <div class='card shadow-sm'>
-      <div class='card-header'>Navigation</div>
-      <div class='list-group list-group-flush'>
+    nav_admin = "<a class='list-group-item list-group-item-action' href='/admin/users'>Benutzerverwaltung</a>" if user["role"] == "admin" else ""
+    flash_html = f"<div class='alert alert-{flash['kind']}'>{html.escape(flash['msg'])}</div>" if flash else ""
+    fullname = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user["username"]
+    return f"""<!doctype html><html lang='de'><head>
+    <meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+    <title>{html.escape(title)}</title><link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>
+    </head><body class='bg-light'>
+    <header class='navbar navbar-expand-lg navbar-dark bg-dark mb-3'><div class='container-fluid'>
+      <a class='navbar-brand' href='/dashboard'>ProPlan</a>
+      <ul class='navbar-nav ms-auto'><li class='nav-item dropdown'>
+        <a class='nav-link dropdown-toggle text-light' href='#' role='button' data-bs-toggle='dropdown'>{html.escape(user['username'])}</a>
+        <ul class='dropdown-menu dropdown-menu-end'>
+          <li><a class='dropdown-item' href='/account'>Mein Account</a></li><li><hr class='dropdown-divider'></li>
+          <li><a class='dropdown-item' href='/logout'>Abmelden</a></li>
+        </ul>
+      </li></ul>
+    </div></header>
+    <div class='container-fluid'><div class='row g-3'>
+      <aside class='col-lg-2'><div class='card shadow-sm'><div class='card-header'>Navigation</div><div class='list-group list-group-flush'>
         <a class='list-group-item list-group-item-action' href='/dashboard'>Dashboard</a>
         <a class='list-group-item list-group-item-action' href='/projects'>Projektverwaltung</a>
-        {nav_admin_link}
-      </div>
-    </div>
-    """
-
-    right_col = f"""
-    <div class='card shadow-sm'>
-      <div class='card-header'>Benutzer</div>
-      <div class='card-body'>
-        <div><strong>{full_name or user_name}</strong></div>
-        <div class='text-muted small'>{user_name}</div>
-        <div>Rolle: {role_badge(user['role'])}</div>
-      </div>
-    </div>
-    """
-
-    return f"""<!doctype html>
-<html lang='de'>
-<head>
-  <meta charset='utf-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>{html.escape(title)}</title>
-  <link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'>
-</head>
-<body class='bg-light'>
-  <header class='navbar navbar-expand-lg navbar-dark bg-dark mb-3'>
-    <div class='container-fluid'>
-      <a class='navbar-brand' href='/dashboard'>ProPlan</a>
-      <ul class='navbar-nav ms-auto'>
-        <li class='nav-item dropdown'>
-          <a class='nav-link dropdown-toggle text-light' href='#' role='button' data-bs-toggle='dropdown'>{user_name}</a>
-          <ul class='dropdown-menu dropdown-menu-end'>
-            <li><a class='dropdown-item' href='/account'>Mein Account</a></li>
-            <li><hr class='dropdown-divider'></li>
-            <li><a class='dropdown-item' href='/logout'>Abmelden</a></li>
-          </ul>
-        </li>
-      </ul>
-    </div>
-  </header>
-  <div class='container-fluid'>
-    <div class='row g-3'>
-      <aside class='col-lg-2'>{left_col}</aside>
+        {nav_admin}
+      </div></div></aside>
       <main class='col-lg-8'>{flash_html}<div class='card shadow-sm'><div class='card-body'>{content}</div></div></main>
-      <aside class='col-lg-2'>{right_col}</aside>
-    </div>
-  </div>
-  <script src='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js'></script>
-</body>
-</html>"""
+      <aside class='col-lg-2'><div class='card shadow-sm'><div class='card-header'>Benutzer</div><div class='card-body'>
+        <div><strong>{html.escape(fullname)}</strong></div><div class='text-muted small'>{html.escape(user['username'])}</div><div>Rolle: {role_badge(user['role'])}</div>
+      </div></div></aside>
+    </div></div>
+    <script src='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js'></script>
+    </body></html>"""
 
 
-def admin_only(start_response, user):
-    page = layout(
-        "Kein Zugriff",
-        "<h2>Kein Zugriff</h2><p>Nur der Admin kann Benutzer anlegen, bearbeiten und löschen.</p>",
-        user,
-        {"kind": "danger", "msg": "Nur Admin."},
-    )
+def forbid(start_response, user, message):
+    page = layout("Kein Zugriff", f"<h2>Kein Zugriff</h2><p>{html.escape(message)}</p>", user, {"kind": "danger", "msg": "Keine Berechtigung."})
     start_response("403 Forbidden", [("Content-Type", "text/html; charset=utf-8")])
     return [page.encode()]
+
+
+def get_current_user(environ):
+    sid = parse_cookies(environ).get("sid")
+    return SESSIONS.get(sid), sid
 
 
 def app(environ, start_response):
     init_db()
     path = environ.get("PATH_INFO", "/")
     method = environ.get("REQUEST_METHOD", "GET")
-    sid = parse_cookies(environ).get("sid")
-    user = SESSIONS.get(sid)
+    user, sid = get_current_user(environ)
 
     if path == "/":
         return redirect(start_response, "/login")
@@ -258,26 +211,15 @@ def app(environ, start_response):
     if path == "/login":
         if method == "POST":
             form = parse_form(environ)
-            conn = sqlite3.connect(DB_PATH)
-            row = conn.execute(
-                "SELECT id, username, email, first_name, last_name, password, role FROM users WHERE username=?",
-                (form.get("username", ""),),
-            ).fetchone()
-            if row and verify_password(row[5], form.get("password", "")):
-                # transparently upgrade legacy plain-text password
-                if not str(row[5]).startswith("pbkdf2_sha256$"):
-                    conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(form.get("password", "")), row[0]))
+            conn = db_connect()
+            row = conn.execute("SELECT * FROM users WHERE username=?", (form.get("username", ""),)).fetchone()
+            if row and verify_password(row["password"], form.get("password", "")):
+                if not row["password"].startswith("pbkdf2_sha256$"):
+                    conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(form.get("password", "")), row["id"]))
                     conn.commit()
                 conn.close()
                 newsid = secrets.token_hex(16)
-                SESSIONS[newsid] = {
-                    "id": row[0],
-                    "username": row[1],
-                    "email": row[2],
-                    "first_name": row[3],
-                    "last_name": row[4],
-                    "role": row[6],
-                }
+                SESSIONS[newsid] = dict(row)
                 return redirect(start_response, "/dashboard", sid=newsid)
             conn.close()
             page = login_page({"kind": "danger", "msg": "Ungültige Zugangsdaten."})
@@ -296,7 +238,7 @@ def app(environ, start_response):
         return redirect(start_response, "/login")
 
     if path == "/dashboard":
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         projects = conn.execute(
             """
             SELECT DISTINCT p.id, p.project_number, p.project_name, p.project_address
@@ -308,136 +250,103 @@ def app(environ, start_response):
             (user["id"], user["id"]),
         ).fetchall()
         conn.close()
-
-        items = []
-        for pid, pnum, pname, paddr in projects:
-            items.append(
+        items = "".join(
+            [
                 "<li class='list-group-item d-flex justify-content-between align-items-center'>"
-                f"<span><strong>{html.escape(pnum)}</strong> – {html.escape(pname)} <span class='text-muted'>({html.escape(paddr)})</span></span>"
-                f"<a class='btn btn-sm btn-outline-secondary' href='/projects/{pid}'>Details</a>"
+                f"<span><strong>{html.escape(p['project_number'])}</strong> – {html.escape(p['project_name'])} <span class='text-muted'>({html.escape(p['project_address'])})</span></span>"
+                f"<a class='btn btn-sm btn-outline-secondary' href='/projects/{p['id']}'>Details</a>"
                 "</li>"
-            )
-
-        items_html = ''.join(items) if items else "<li class='list-group-item text-muted'>Keine zugewiesenen Projekte.</li>"
+                for p in projects
+            ]
+        )
+        if not items:
+            items = "<li class='list-group-item text-muted'>Keine zugewiesenen Projekte.</li>"
         body = (
             f"<h2>Dashboard</h2><p>Willkommen <strong>{html.escape(user.get('first_name', ''))} {html.escape(user.get('last_name', ''))}</strong>.</p>"
-            "<h3 class='h5 mt-4'>Meine berechtigten Projekte</h3>"
-            "<ul class='list-group'>"
-            f"{items_html}"
-            "</ul>"
+            "<h3 class='h5 mt-4'>Meine berechtigten Projekte</h3><ul class='list-group'>"
+            f"{items}</ul>"
         )
         page = layout("Dashboard", body, user)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [page.encode()]
 
     if path == "/projects":
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         projects = conn.execute(
             """
-            SELECT p.id, p.project_number, p.project_name, p.project_address, p.created_at, p.created_by,
-                   u.username
-            FROM projects p
-            JOIN users u ON u.id = p.created_by
+            SELECT p.id, p.project_number, p.project_name, p.project_address, p.created_at, p.created_by, u.username owner
+            FROM projects p JOIN users u ON u.id = p.created_by
             ORDER BY p.id DESC
             """
         ).fetchall()
         conn.close()
-
         rows = []
-        for pid, pnum, pname, paddr, created, owner_id, owner_username in projects:
-            actions = "<span class='text-muted'>Nur Besitzer</span>"
-            if int(owner_id) == int(user["id"]):
-                actions = f"<a class='btn btn-sm btn-outline-secondary' href='/projects/{pid}'>Bearbeiten</a>"
+        for p in projects:
+            action = "<span class='text-muted'>Nur Besitzer</span>"
+            if p["created_by"] == user["id"]:
+                action = f"<a class='btn btn-sm btn-outline-secondary' href='/projects/{p['id']}'>Bearbeiten</a>"
             rows.append(
                 "<tr>"
-                f"<td>{html.escape(pnum)}</td>"
-                f"<td>{html.escape(pname)}</td>"
-                f"<td>{html.escape(paddr)}</td>"
-                f"<td>{html.escape(owner_username)}</td>"
-                f"<td>{html.escape(created)}</td>"
-                f"<td>{actions}</td>"
+                f"<td>{html.escape(p['project_number'])}</td><td>{html.escape(p['project_name'])}</td><td>{html.escape(p['project_address'])}</td>"
+                f"<td>{html.escape(p['owner'])}</td><td>{html.escape(p['created_at'])}</td><td>{action}</td>"
                 "</tr>"
             )
-
         body = (
-            "<div class='d-flex justify-content-between align-items-center mb-3'>"
-            "<h2 class='mb-0'>Projektverwaltung</h2>"
-            "<a class='btn btn-success' href='/projects/new'>Neues Projekt anlegen</a>"
-            "</div>"
+            "<div class='d-flex justify-content-between align-items-center mb-3'><h2 class='mb-0'>Projektverwaltung</h2>"
+            "<a class='btn btn-success' href='/projects/new'>Neues Projekt anlegen</a></div>"
             "<div class='table-responsive'><table class='table table-striped align-middle'>"
             "<thead><tr><th>Projektnummer</th><th>Projektname</th><th>Projektadresse</th><th>Besitzer</th><th>Erstellt</th><th>Aktionen</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
-            "<p class='text-muted small mt-2 mb-0'>Die interne Projekt-ID wird technisch geführt und für Berechtigungen verwendet.</p>"
         )
         page = layout("Projektverwaltung", body, user)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [page.encode()]
 
     if path == "/projects/new":
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         if method == "POST":
             form = parse_form(environ)
-            project_number = form.get("project_number", "").strip()
-            project_name = form.get("project_name", "").strip()
-            project_address = form.get("project_address", "").strip()
-
-            exists = conn.execute("SELECT id FROM projects WHERE project_number=?", (project_number,)).fetchone()
-            if len(project_number) < 2 or len(project_name) < 2 or len(project_address) < 5:
-                flash = {"kind": "warning", "msg": "Projektnummer/Projektname zu kurz oder Projektadresse ungültig."}
+            pnum = form.get("project_number", "").strip()
+            pname = form.get("project_name", "").strip()
+            paddr = form.get("project_address", "").strip()
+            exists = conn.execute("SELECT id FROM projects WHERE project_number=?", (pnum,)).fetchone()
+            if len(pnum) < 2 or len(pname) < 2 or len(paddr) < 5:
+                flash = {"kind": "warning", "msg": "Bitte gültige Projektdaten eingeben."}
             elif exists:
-                flash = {"kind": "danger", "msg": "Projektnummer ist bereits vorhanden."}
+                flash = {"kind": "danger", "msg": "Projektnummer bereits vergeben."}
             else:
-                conn.execute(
-                    "INSERT INTO projects (project_number, project_name, project_address, created_by) VALUES (?, ?, ?, ?)",
-                    (project_number, project_name, project_address, user["id"]),
-                )
+                conn.execute("INSERT INTO projects (project_number, project_name, project_address, created_by) VALUES (?, ?, ?, ?)", (pnum, pname, paddr, user["id"]))
                 conn.commit()
                 conn.close()
                 return redirect(start_response, "/projects")
         else:
             flash = None
         conn.close()
-
         body = (
-            "<h2>Neues Projekt anlegen</h2>"
-            "<form method='post' class='row g-3'>"
+            "<h2>Neues Projekt anlegen</h2><form method='post' class='row g-3'>"
             "<div class='col-md-4'><label class='form-label'>Projektnummer</label><input class='form-control' name='project_number' required></div>"
             "<div class='col-md-4'><label class='form-label'>Projektname</label><input class='form-control' name='project_name' required></div>"
             "<div class='col-md-4'><label class='form-label'>Projektadresse</label><input class='form-control' name='project_address' required></div>"
-            "<div class='col-12 d-flex gap-2'><button class='btn btn-success'>Speichern</button><a class='btn btn-outline-secondary' href='/projects'>Zurück</a></div>"
-            "</form>"
+            "<div class='col-12 d-flex gap-2'><button class='btn btn-success'>Speichern</button><a class='btn btn-outline-secondary' href='/projects'>Zurück</a></div></form>"
         )
         page = layout("Projekt anlegen", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [page.encode()]
-
 
     if path.startswith("/projects/"):
         pid = path.split("/")[-1]
         if not pid.isdigit():
             start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
             return [b"Not found"]
-
-        conn = sqlite3.connect(DB_PATH)
-        project = conn.execute(
-            "SELECT id, project_number, project_name, project_address, created_by, created_at FROM projects WHERE id=?",
-            (pid,),
-        ).fetchone()
+        conn = db_connect()
+        project = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
         if not project:
             conn.close()
             start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
             return [b"Not found"]
-
-        if int(project[4]) != int(user["id"]):
+        if project["created_by"] != user["id"]:
             conn.close()
-            page = layout(
-                "Kein Zugriff",
-                "<h2>Kein Zugriff</h2><p>Nur der Besitzer des Projekts kann dieses Projekt bearbeiten oder löschen.</p>",
-                user,
-                {"kind": "danger", "msg": "Nur Projektbesitzer."},
-            )
-            start_response("403 Forbidden", [("Content-Type", "text/html; charset=utf-8")])
-            return [page.encode()]
+            return forbid(start_response, user, "Nur der Besitzer des Projekts kann das Projekt bearbeiten oder löschen.")
 
         flash = None
         if method == "POST":
@@ -445,120 +354,187 @@ def app(environ, start_response):
             action = form.get("action", "save")
             if action == "delete":
                 conn.execute("DELETE FROM projects WHERE id=?", (pid,))
-                conn.execute("DELETE FROM project_editors WHERE project_id=?", (pid,))
                 conn.commit()
                 conn.close()
                 return redirect(start_response, "/projects")
-            if action == "add_editor":
+            elif action == "save":
+                pnum = form.get("project_number", "").strip()
+                pname = form.get("project_name", "").strip()
+                paddr = form.get("project_address", "").strip()
+                new_owner = form.get("owner_user_id", str(user["id"]))
+                duplicate = conn.execute("SELECT id FROM projects WHERE project_number=? AND id != ?", (pnum, pid)).fetchone()
+                owner_exists = conn.execute("SELECT id FROM users WHERE id=?", (new_owner,)).fetchone() if new_owner.isdigit() else None
+                if len(pnum) < 2 or len(pname) < 2 or len(paddr) < 5:
+                    flash = {"kind": "warning", "msg": "Bitte gültige Projektdaten eingeben."}
+                elif duplicate:
+                    flash = {"kind": "danger", "msg": "Projektnummer bereits vergeben."}
+                elif not owner_exists:
+                    flash = {"kind": "danger", "msg": "Ungültiger Projektbesitzer."}
+                else:
+                    conn.execute(
+                        "UPDATE projects SET project_number=?, project_name=?, project_address=?, created_by=? WHERE id=?",
+                        (pnum, pname, paddr, new_owner, pid),
+                    )
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Projekt gespeichert."}
+            elif action == "add_editor":
                 editor_id = form.get("editor_user_id", "")
-                if editor_id.isdigit() and int(editor_id) != int(user["id"]):
-                    exists_user = conn.execute("SELECT id FROM users WHERE id=?", (editor_id,)).fetchone()
-                    if exists_user:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO project_editors (project_id, user_id) VALUES (?, ?)",
-                            (pid, editor_id),
-                        )
-                        conn.commit()
-                        flash = {"kind": "success", "msg": "Bearbeiter zugeordnet."}
+                if editor_id.isdigit() and int(editor_id) != user["id"]:
+                    conn.execute("INSERT OR IGNORE INTO project_editors (project_id, user_id) VALUES (?, ?)", (pid, editor_id))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Bearbeiter zugeordnet."}
             elif action == "remove_editor":
                 editor_id = form.get("editor_user_id", "")
                 if editor_id.isdigit():
                     conn.execute("DELETE FROM project_editors WHERE project_id=? AND user_id=?", (pid, editor_id))
                     conn.commit()
                     flash = {"kind": "success", "msg": "Bearbeiter entfernt."}
-            else:
-                project_number = form.get("project_number", "").strip()
-                project_name = form.get("project_name", "").strip()
-                project_address = form.get("project_address", "").strip()
-                duplicate = conn.execute(
-                    "SELECT id FROM projects WHERE project_number=? AND id != ?",
-                    (project_number, pid),
-                ).fetchone()
-                if len(project_number) < 2 or len(project_name) < 2 or len(project_address) < 5:
-                    flash = {"kind": "warning", "msg": "Projektnummer/Projektname zu kurz oder Projektadresse ungültig."}
-                elif duplicate:
-                    flash = {"kind": "danger", "msg": "Projektnummer ist bereits vorhanden."}
+            elif action == "add_address":
+                title = form.get("title", "").strip()
+                address = form.get("address", "").strip()
+                if len(title) < 2 or len(address) < 5:
+                    flash = {"kind": "warning", "msg": "Adresse konnte nicht angelegt werden."}
                 else:
-                    conn.execute(
-                        "UPDATE projects SET project_number=?, project_name=?, project_address=? WHERE id=?",
-                        (project_number, project_name, project_address, pid),
-                    )
+                    conn.execute("INSERT INTO project_addresses (project_id, title, address) VALUES (?, ?, ?)", (pid, title, address))
                     conn.commit()
-                    flash = {"kind": "success", "msg": "Projekt gespeichert."}
+                    flash = {"kind": "success", "msg": "Adresse angelegt."}
+            elif action == "edit_address":
+                aid = form.get("address_id", "")
+                title = form.get("title", "").strip()
+                address = form.get("address", "").strip()
+                if aid.isdigit() and len(title) >= 2 and len(address) >= 5:
+                    conn.execute("UPDATE project_addresses SET title=?, address=? WHERE id=? AND project_id=?", (title, address, aid, pid))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Adresse gespeichert."}
+            elif action == "delete_address":
+                aid = form.get("address_id", "")
+                if aid.isdigit():
+                    conn.execute("DELETE FROM project_addresses WHERE id=? AND project_id=?", (aid, pid))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Adresse gelöscht."}
+            elif action == "add_plan":
+                title = form.get("title", "").strip()
+                content = form.get("content", "").strip()
+                if len(title) < 2 or len(content) < 2:
+                    flash = {"kind": "warning", "msg": "Plan konnte nicht angelegt werden."}
+                else:
+                    conn.execute("INSERT INTO project_plans (project_id, title, content) VALUES (?, ?, ?)", (pid, title, content))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Plan angelegt."}
+            elif action == "edit_plan":
+                plid = form.get("plan_id", "")
+                title = form.get("title", "").strip()
+                content = form.get("content", "").strip()
+                if plid.isdigit() and len(title) >= 2 and len(content) >= 2:
+                    conn.execute("UPDATE project_plans SET title=?, content=? WHERE id=? AND project_id=?", (title, content, plid, pid))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Plan gespeichert."}
+            elif action == "delete_plan":
+                plid = form.get("plan_id", "")
+                if plid.isdigit():
+                    conn.execute("DELETE FROM project_plans WHERE id=? AND project_id=?", (plid, pid))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Plan gelöscht."}
 
-            project = conn.execute(
-                "SELECT id, project_number, project_name, project_address, created_by, created_at FROM projects WHERE id=?",
-                (pid,),
-            ).fetchone()
+            project = conn.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
 
+        users = conn.execute("SELECT id, username, first_name, last_name FROM users ORDER BY username").fetchall()
         assigned = conn.execute(
-            """
-            SELECT u.id, u.username, u.first_name, u.last_name
-            FROM project_editors pe
-            JOIN users u ON u.id = pe.user_id
-            WHERE pe.project_id=?
-            ORDER BY u.username
-            """,
+            "SELECT u.id, u.username, u.first_name, u.last_name FROM project_editors pe JOIN users u ON u.id=pe.user_id WHERE pe.project_id=? ORDER BY u.username",
             (pid,),
         ).fetchall()
         available = conn.execute(
-            """
-            SELECT id, username, first_name, last_name
-            FROM users
-            WHERE id != ? AND id NOT IN (SELECT user_id FROM project_editors WHERE project_id=?)
-            ORDER BY username
-            """,
+            "SELECT id, username, first_name, last_name FROM users WHERE id != ? AND id NOT IN (SELECT user_id FROM project_editors WHERE project_id=?) ORDER BY username",
             (user["id"], pid),
         ).fetchall()
+        addresses = conn.execute("SELECT id, title, address FROM project_addresses WHERE project_id=? ORDER BY id DESC", (pid,)).fetchall()
+        plans = conn.execute("SELECT id, title, content FROM project_plans WHERE project_id=? ORDER BY id DESC", (pid,)).fetchall()
         conn.close()
 
-        assigned_rows = []
-        for uid, uname, fname, lname in assigned:
-            display = f"{fname} {lname}".strip() or uname
-            assigned_rows.append(
+        owner_opts = []
+        for u in users:
+            label = (f"{u['first_name']} {u['last_name']}".strip() or u["username"])
+            sel = "selected" if u["id"] == project["created_by"] else ""
+            owner_opts.append(f"<option value='{u['id']}' {sel}>{html.escape(label)} ({html.escape(u['username'])})</option>")
+
+        av_opts = []
+        for u in available:
+            label = (f"{u['first_name']} {u['last_name']}".strip() or u["username"])
+            av_opts.append(f"<option value='{u['id']}'>{html.escape(label)} ({html.escape(u['username'])})</option>")
+        if not av_opts:
+            av_opts = ["<option value='' disabled>Keine verfügbaren Benutzer</option>"]
+
+        assigned_html = []
+        for u in assigned:
+            label = (f"{u['first_name']} {u['last_name']}".strip() or u["username"])
+            assigned_html.append(
                 "<li class='list-group-item d-flex justify-content-between align-items-center'>"
-                f"<span>{html.escape(display)} <span class='text-muted'>({html.escape(uname)})</span></span>"
-                "<form method='post' class='mb-0'>"
-                "<input type='hidden' name='action' value='remove_editor'>"
-                f"<input type='hidden' name='editor_user_id' value='{uid}'>"
-                "<button class='btn btn-sm btn-outline-danger'>Entfernen</button>"
-                "</form></li>"
+                f"<span>{html.escape(label)} <span class='text-muted'>({html.escape(u['username'])})</span></span>"
+                "<form method='post' class='mb-0'><input type='hidden' name='action' value='remove_editor'>"
+                f"<input type='hidden' name='editor_user_id' value='{u['id']}'><button class='btn btn-sm btn-outline-danger'>Entfernen</button></form></li>"
             )
+        if not assigned_html:
+            assigned_html = ["<li class='list-group-item text-muted'>Keine Bearbeiter zugeordnet.</li>"]
 
-        options = []
-        for uid, uname, fname, lname in available:
-            display = f"{fname} {lname}".strip() or uname
-            options.append(f"<option value='{uid}'>{html.escape(display)} ({html.escape(uname)})</option>")
+        address_html = []
+        for a in addresses:
+            address_html.append(
+                "<div class='border rounded p-2 mb-2'><form method='post' class='row g-2'>"
+                "<input type='hidden' name='action' value='edit_address'>"
+                f"<input type='hidden' name='address_id' value='{a['id']}'>"
+                f"<div class='col-md-4'><input class='form-control' name='title' value='{html.escape(a['title'])}'></div>"
+                f"<div class='col-md-6'><input class='form-control' name='address' value='{html.escape(a['address'])}'></div>"
+                "<div class='col-md-2 d-flex gap-2'><button class='btn btn-sm btn-primary'>Speichern</button></form>"
+                "<form method='post'><input type='hidden' name='action' value='delete_address'>"
+                f"<input type='hidden' name='address_id' value='{a['id']}'><button class='btn btn-sm btn-danger'>Löschen</button></form></div></div>"
+            )
+        if not address_html:
+            address_html = ["<p class='text-muted'>Keine Adressen vorhanden.</p>"]
 
-        options_html = ''.join(options) if options else "<option value=''>Keine verfügbaren Benutzer</option>"
-        assigned_html = ''.join(assigned_rows) if assigned_rows else "<li class='list-group-item text-muted'>Keine Bearbeiter zugeordnet.</li>"
-
-        options_html = ''.join(options) if options else "<option value='' disabled>Keine verfügbaren Benutzer</option>"
-        assigned_html = ''.join(assigned_rows) if assigned_rows else "<li class='list-group-item text-muted'>Keine Bearbeiter zugeordnet.</li>"
+        plan_html = []
+        for pl in plans:
+            plan_html.append(
+                "<div class='border rounded p-2 mb-2'><form method='post' class='row g-2'>"
+                "<input type='hidden' name='action' value='edit_plan'>"
+                f"<input type='hidden' name='plan_id' value='{pl['id']}'>"
+                f"<div class='col-md-4'><input class='form-control' name='title' value='{html.escape(pl['title'])}'></div>"
+                f"<div class='col-md-6'><textarea class='form-control' name='content' rows='2'>{html.escape(pl['content'])}</textarea></div>"
+                "<div class='col-md-2 d-flex gap-2'><button class='btn btn-sm btn-primary'>Speichern</button></form>"
+                "<form method='post'><input type='hidden' name='action' value='delete_plan'>"
+                f"<input type='hidden' name='plan_id' value='{pl['id']}'><button class='btn btn-sm btn-danger'>Löschen</button></form></div></div>"
+            )
+        if not plan_html:
+            plan_html = ["<p class='text-muted'>Keine Pläne vorhanden.</p>"]
 
         body = (
-            "<h2>Projektdetails</h2>"
-            "<form method='post' class='row g-3'>"
+            "<h2>Projektdetails</h2><form method='post' class='row g-3'>"
             "<input type='hidden' name='action' value='save'>"
-            f"<div class='col-md-4'><label class='form-label'>Interne Projekt-ID</label><input class='form-control' value='{project[0]}' disabled></div>"
-            f"<div class='col-md-4'><label class='form-label'>Projektnummer</label><input class='form-control' name='project_number' value='{html.escape(project[1])}' required></div>"
-            f"<div class='col-md-4'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(project[5])}' disabled></div>"
-            f"<div class='col-md-6'><label class='form-label'>Projektname</label><input class='form-control' name='project_name' value='{html.escape(project[2])}' required></div>"
-            f"<div class='col-md-6'><label class='form-label'>Projektadresse</label><input class='form-control' name='project_address' value='{html.escape(project[3])}' required></div>"
+            f"<div class='col-md-4'><label class='form-label'>Projektnummer</label><input class='form-control' name='project_number' value='{html.escape(project['project_number'])}' required></div>"
+            f"<div class='col-md-4'><label class='form-label'>Projektname</label><input class='form-control' name='project_name' value='{html.escape(project['project_name'])}' required></div>"
+            f"<div class='col-md-4'><label class='form-label'>Projektadresse</label><input class='form-control' name='project_address' value='{html.escape(project['project_address'])}' required></div>"
+            f"<div class='col-md-6'><label class='form-label'>Projektbesitzer</label><select class='form-select' name='owner_user_id'>{''.join(owner_opts)}</select></div>"
+            f"<div class='col-md-6'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(project['created_at'])}' disabled></div>"
             "<div class='col-12 d-flex gap-2'><button class='btn btn-primary'>Speichern</button></form>"
             "<form method='post'><input type='hidden' name='action' value='delete'><button class='btn btn-danger'>Löschen</button></form>"
             "<a class='btn btn-outline-secondary' href='/projects'>Zurück</a></div>"
-            "<hr class='my-4'>"
-            "<h3 class='h5'>Bearbeiter zuordnen</h3>"
-            "<form method='post' class='row g-2 align-items-end mb-3'>"
+            "<hr><h3 class='h5'>Bearbeiter zuordnen</h3><form method='post' class='row g-2 align-items-end mb-2'>"
             "<input type='hidden' name='action' value='add_editor'>"
-            f"<div class='col-md-8'><label class='form-label'>Benutzer</label><select class='form-select' name='editor_user_id'>{options_html}</select></div>"
-            "<div class='col-md-4'><button class='btn btn-success w-100'>Zuordnen</button></div>"
-            "</form>"
-            "<ul class='list-group'>"
-            f"{assigned_html}"
-            "</ul>"
-            "<p class='text-muted small mt-2 mb-0'>Die Zuordnung nutzt interne Benutzer-IDs.</p>"
+            f"<div class='col-md-8'><select class='form-select' name='editor_user_id'>{''.join(av_opts)}</select></div>"
+            f"<div class='col-md-4'><button class='btn btn-success w-100' {'disabled' if 'Keine verfügbaren Benutzer' in av_opts[0] else ''}>Zuordnen</button></div>"
+            "</form><ul class='list-group mb-4'>"
+            f"{''.join(assigned_html)}</ul>"
+            "<h3 class='h5'>Adressen verwalten</h3>"
+            "<form method='post' class='row g-2 mb-2'><input type='hidden' name='action' value='add_address'>"
+            "<div class='col-md-4'><input class='form-control' name='title' placeholder='Bezeichnung' required></div>"
+            "<div class='col-md-6'><input class='form-control' name='address' placeholder='Adresse' required></div>"
+            "<div class='col-md-2'><button class='btn btn-success w-100'>Anlegen</button></div></form>"
+            f"{''.join(address_html)}"
+            "<hr><h3 class='h5'>Pläne verwalten (Text)</h3>"
+            "<form method='post' class='row g-2 mb-2'><input type='hidden' name='action' value='add_plan'>"
+            "<div class='col-md-4'><input class='form-control' name='title' placeholder='Titel' required></div>"
+            "<div class='col-md-6'><textarea class='form-control' name='content' rows='2' placeholder='Planinhalt' required></textarea></div>"
+            "<div class='col-md-2'><button class='btn btn-success w-100'>Anlegen</button></div></form>"
+            f"{''.join(plan_html)}"
         )
         page = layout("Projektdetails", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
@@ -579,7 +555,7 @@ def app(environ, start_response):
 
     if path == "/admin/users":
         if user["role"] != "admin":
-            return admin_only(start_response, user)
+            return forbid(start_response, user, "Nur der Admin kann Benutzer anlegen, bearbeiten und löschen.")
 
         query = parse_qs(environ.get("QUERY_STRING", ""))
         sort = query.get("sort", ["role"])[0]
@@ -589,18 +565,16 @@ def app(environ, start_response):
         if direction not in {"asc", "desc"}:
             direction = "asc"
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         flash = None
         if method == "POST":
             form = parse_form(environ)
             if form.get("action") == "delete":
                 uid = form.get("user_id", "")
                 if uid.isdigit() and str(user["id"]) != uid:
-                    target = conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
-                    if target:
-                        conn.execute("DELETE FROM users WHERE id=?", (uid,))
-                        conn.commit()
-                        flash = {"kind": "success", "msg": f"Benutzer {target[0]} gelöscht."}
+                    conn.execute("DELETE FROM users WHERE id=?", (uid,))
+                    conn.commit()
+                    flash = {"kind": "success", "msg": "Benutzer gelöscht."}
 
         users = conn.execute(
             f"SELECT id, first_name, last_name, username, email, role FROM users ORDER BY {sort} {direction.upper()}, id ASC"
@@ -608,41 +582,27 @@ def app(environ, start_response):
         conn.close()
 
         rows = []
-        for uid, first_name, last_name, uname, email, role in users:
+        for u in users:
             rows.append(
                 "<tr>"
-                f"<td>{uid}</td>"
-                f"<td>{html.escape(first_name)}</td>"
-                f"<td>{html.escape(last_name)}</td>"
-                f"<td>{html.escape(uname)}</td>"
-                f"<td>{html.escape(email)}</td>"
-                f"<td>{role_badge(role)}</td>"
+                f"<td>{html.escape(u['first_name'])}</td><td>{html.escape(u['last_name'])}</td><td>{html.escape(u['username'])}</td><td>{html.escape(u['email'])}</td><td>{role_badge(u['role'])}</td>"
                 "<td><div class='d-flex gap-2'>"
-                f"<a class='btn btn-sm btn-outline-secondary' href='/admin/users/{uid}'>Bearbeiten</a>"
-                "<form method='post'>"
-                "<input type='hidden' name='action' value='delete'>"
-                f"<input type='hidden' name='user_id' value='{uid}'>"
-                "<button class='btn btn-sm btn-outline-danger'>Löschen</button>"
-                "</form></div></td>"
-                "</tr>"
+                f"<a class='btn btn-sm btn-outline-secondary' href='/admin/users/{u['id']}'>Bearbeiten</a>"
+                "<form method='post'><input type='hidden' name='action' value='delete'>"
+                f"<input type='hidden' name='user_id' value='{u['id']}'><button class='btn btn-sm btn-outline-danger'>Löschen</button></form></div></td></tr>"
             )
 
         headers = []
         for col, label in (("first_name", "Vorname"), ("last_name", "Nachname"), ("username", "Benutzername"), ("email", "E-Mailadresse"), ("role", "Rolle")):
-            next_dir = "desc" if (sort == col and direction == "asc") else "asc"
-            arrow = ""
-            if sort == col:
-                arrow = " ▲" if direction == "asc" else " ▼"
-            headers.append(f"<th><a class='link-dark text-decoration-none' href='/admin/users?sort={col}&dir={next_dir}'>{label}{arrow}</a></th>")
+            nxt = "desc" if (sort == col and direction == "asc") else "asc"
+            arrow = " ▲" if sort == col and direction == "asc" else (" ▼" if sort == col else "")
+            headers.append(f"<th><a class='link-dark text-decoration-none' href='/admin/users?sort={col}&dir={nxt}'>{label}{arrow}</a></th>")
 
         body = (
-            "<div class='d-flex justify-content-between align-items-center mb-3'>"
-            "<h2 class='mb-0'>Benutzerverwaltung</h2>"
-            "<a class='btn btn-success' href='/admin/users/new'>Neuen Benutzer anlegen</a>"
-            "</div>"
+            "<div class='d-flex justify-content-between align-items-center mb-3'><h2 class='mb-0'>Benutzerverwaltung</h2>"
+            "<a class='btn btn-success' href='/admin/users/new'>Neuen Benutzer anlegen</a></div>"
             "<div class='table-responsive'><table class='table table-striped align-middle'>"
-            f"<thead><tr><th>Interne Benutzer-ID</th>{''.join(headers)}<th>Aktionen</th></tr></thead>"
-            f"<tbody>{''.join(rows)}</tbody></table></div>"
+            f"<thead><tr>{''.join(headers)}<th>Aktionen</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
         )
         page = layout("Benutzerverwaltung", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
@@ -650,22 +610,20 @@ def app(environ, start_response):
 
     if path == "/admin/users/new":
         if user["role"] != "admin":
-            return admin_only(start_response, user)
-
-        conn = sqlite3.connect(DB_PATH)
+            return forbid(start_response, user, "Nur der Admin kann Benutzer anlegen, bearbeiten und löschen.")
+        conn = db_connect()
         if method == "POST":
-            form = parse_form(environ)
-            first_name = form.get("first_name", "").strip()
-            last_name = form.get("last_name", "").strip()
-            username = form.get("username", "").strip()
-            email = form.get("email", "").strip()
-            password = form.get("password", "")
-            role = form.get("role", "bearbeiter")
+            f = parse_form(environ)
+            first_name = f.get("first_name", "").strip()
+            last_name = f.get("last_name", "").strip()
+            username = f.get("username", "").strip()
+            email = f.get("email", "").strip()
+            password = f.get("password", "")
+            role = f.get("role", "bearbeiter")
             if role not in ROLES:
                 role = "bearbeiter"
             exists_user = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
             exists_email = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
-
             if len(username) < 3 or "@" not in email or len(password) < 6:
                 flash = {"kind": "warning", "msg": "Benutzername >=3, gültige E-Mailadresse und Passwort >=6 erforderlich."}
             elif exists_user:
@@ -683,19 +641,16 @@ def app(environ, start_response):
         else:
             flash = None
         conn.close()
-
-        options = "".join([f"<option value='{r}'>{ROLE_LABELS.get(r, r)}</option>" for r in ROLES])
+        opts = "".join([f"<option value='{r}'>{ROLE_LABELS[r]}</option>" for r in ROLES])
         body = (
-            "<h2>Neuen Benutzer anlegen</h2>"
-            "<form method='post' class='row g-3'>"
+            "<h2>Neuen Benutzer anlegen</h2><form method='post' class='row g-3'>"
             "<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name'></div>"
             "<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name'></div>"
             "<div class='col-md-6'><label class='form-label'>Benutzername</label><input class='form-control' name='username' required></div>"
             "<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='email' type='email' required></div>"
             "<div class='col-md-6'><label class='form-label'>Passwort</label><input class='form-control' type='password' name='password' required minlength='6'></div>"
-            f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{options}</select></div>"
-            "<div class='col-12 d-flex gap-2'><button class='btn btn-success'>Speichern</button><a class='btn btn-outline-secondary' href='/admin/users'>Zurück</a></div>"
-            "</form>"
+            f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{opts}</select></div>"
+            "<div class='col-12 d-flex gap-2'><button class='btn btn-success'>Speichern</button><a class='btn btn-outline-secondary' href='/admin/users'>Zurück</a></div></form>"
         )
         page = layout("Benutzer anlegen", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
@@ -703,95 +658,61 @@ def app(environ, start_response):
 
     if path.startswith("/admin/users/"):
         if user["role"] != "admin":
-            return admin_only(start_response, user)
-
+            return forbid(start_response, user, "Nur der Admin kann Benutzer anlegen, bearbeiten und löschen.")
         uid = path.split("/")[-1]
         if not uid.isdigit():
             start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
             return [b"Not found"]
-
-        conn = sqlite3.connect(DB_PATH)
-        target = conn.execute(
-            "SELECT id, first_name, last_name, username, email, role, created_at FROM users WHERE id=?",
-            (uid,),
-        ).fetchone()
+        conn = db_connect()
+        target = conn.execute("SELECT id, first_name, last_name, username, email, role, created_at FROM users WHERE id=?", (uid,)).fetchone()
         if not target:
-            conn.close()
-            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
-            return [b"Not found"]
-
+            conn.close(); start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]); return [b"Not found"]
         flash = None
         if method == "POST":
-            form = parse_form(environ)
-            action = form.get("action", "save")
+            f = parse_form(environ)
+            action = f.get("action", "save")
             if action == "delete":
                 if str(user["id"]) == uid:
                     flash = {"kind": "warning", "msg": "Du kannst dich nicht selbst löschen."}
                 else:
                     conn.execute("DELETE FROM users WHERE id=?", (uid,))
-                    conn.commit()
-                    conn.close()
-                    return redirect(start_response, "/admin/users")
+                    conn.commit(); conn.close(); return redirect(start_response, "/admin/users")
             else:
-                first_name = form.get("first_name", "").strip()
-                last_name = form.get("last_name", "").strip()
-                username = form.get("username", "").strip()
-                email = form.get("email", "").strip()
-                role = form.get("role", target[5])
-                password = form.get("password", "")
-                if role not in ROLES:
-                    role = target[5]
-
-                existing_name = conn.execute("SELECT id FROM users WHERE username=? AND id != ?", (username, uid)).fetchone()
-                existing_email = conn.execute("SELECT id FROM users WHERE email=? AND id != ?", (email, uid)).fetchone()
-
+                first_name = f.get("first_name", "").strip(); last_name = f.get("last_name", "").strip()
+                username = f.get("username", "").strip(); email = f.get("email", "").strip(); role = f.get("role", target["role"])
+                password = f.get("password", "")
+                if role not in ROLES: role = target["role"]
+                exists_user = conn.execute("SELECT id FROM users WHERE username=? AND id != ?", (username, uid)).fetchone()
+                exists_email = conn.execute("SELECT id FROM users WHERE email=? AND id != ?", (email, uid)).fetchone()
                 if len(username) < 3 or "@" not in email:
                     flash = {"kind": "warning", "msg": "Benutzername >=3 und gültige E-Mailadresse erforderlich."}
-                elif existing_name:
+                elif exists_user:
                     flash = {"kind": "danger", "msg": "Benutzername bereits vergeben."}
-                elif existing_email:
+                elif exists_email:
                     flash = {"kind": "danger", "msg": "E-Mailadresse bereits vergeben."}
                 elif password and len(password) < 6:
                     flash = {"kind": "warning", "msg": "Neues Passwort muss mindestens 6 Zeichen haben."}
                 else:
                     if password:
-                        conn.execute(
-                            "UPDATE users SET first_name=?, last_name=?, username=?, email=?, role=?, password=? WHERE id=?",
-                            (first_name, last_name, username, email, role, hash_password(password), uid),
-                        )
+                        conn.execute("UPDATE users SET first_name=?, last_name=?, username=?, email=?, role=?, password=? WHERE id=?", (first_name,last_name,username,email,role,hash_password(password),uid))
                     else:
-                        conn.execute(
-                            "UPDATE users SET first_name=?, last_name=?, username=?, email=?, role=? WHERE id=?",
-                            (first_name, last_name, username, email, role, uid),
-                        )
-                    conn.commit()
-                    flash = {"kind": "success", "msg": "Benutzer gespeichert."}
-
-            target = conn.execute(
-                "SELECT id, first_name, last_name, username, email, role, created_at FROM users WHERE id=?",
-                (uid,),
-            ).fetchone()
-
+                        conn.execute("UPDATE users SET first_name=?, last_name=?, username=?, email=?, role=? WHERE id=?", (first_name,last_name,username,email,role,uid))
+                    conn.commit(); flash = {"kind": "success", "msg": "Benutzer gespeichert."}
+            target = conn.execute("SELECT id, first_name, last_name, username, email, role, created_at FROM users WHERE id=?", (uid,)).fetchone()
         conn.close()
-        options = "".join([f"<option value='{r}' {'selected' if r == target[5] else ''}>{ROLE_LABELS.get(r, r)}</option>" for r in ROLES])
+        opts = "".join([f"<option value='{r}' {'selected' if r==target['role'] else ''}>{ROLE_LABELS[r]}</option>" for r in ROLES])
         body = (
-            "<h2>Benutzerdetails</h2>"
-            "<form method='post' class='row g-3'>"
-            f"<div class='col-md-4'><label class='form-label'>Interne Benutzer-ID</label><input class='form-control' value='{target[0]}' disabled></div>"
-            "<input type='hidden' name='action' value='save'>"
-            f"<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name' value='{html.escape(target[1])}'></div>"
-            f"<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name' value='{html.escape(target[2])}'></div>"
-            f"<div class='col-md-6'><label class='form-label'>Benutzername</label><input class='form-control' name='username' value='{html.escape(target[3])}' required></div>"
-            f"<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' name='email' type='email' value='{html.escape(target[4])}' required></div>"
-            f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{options}</select></div>"
+            "<h2>Benutzerdetails</h2><form method='post' class='row g-3'><input type='hidden' name='action' value='save'>"
+            f"<div class='col-md-6'><label class='form-label'>Vorname</label><input class='form-control' name='first_name' value='{html.escape(target['first_name'])}'></div>"
+            f"<div class='col-md-6'><label class='form-label'>Nachname</label><input class='form-control' name='last_name' value='{html.escape(target['last_name'])}'></div>"
+            f"<div class='col-md-6'><label class='form-label'>Benutzername</label><input class='form-control' name='username' value='{html.escape(target['username'])}' required></div>"
+            f"<div class='col-md-6'><label class='form-label'>E-Mailadresse</label><input class='form-control' type='email' name='email' value='{html.escape(target['email'])}' required></div>"
+            f"<div class='col-md-6'><label class='form-label'>Rolle</label><select class='form-select' name='role'>{opts}</select></div>"
             "<div class='col-md-6'><label class='form-label'>Neues Passwort (optional)</label><input class='form-control' type='password' name='password'></div>"
-            f"<div class='col-md-6'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(target[6])}' disabled></div>"
-            "<div class='col-12 d-flex gap-2'>"
-            "<button class='btn btn-primary'>Speichern</button>"
-            "</form>"
+            f"<div class='col-md-6'><label class='form-label'>Erstellt</label><input class='form-control' value='{html.escape(target['created_at'])}' disabled></div>"
+            "<div class='col-12 d-flex gap-2'><button class='btn btn-primary'>Speichern</button></form>"
             "<form method='post'><input type='hidden' name='action' value='delete'><button class='btn btn-danger'>Löschen</button></form>"
-            "<a class='btn btn-outline-secondary' href='/admin/users'>Zurück</a>"
-            "</div>"
+            "<a class='btn btn-outline-secondary' href='/admin/users'>Zurück</a></div>"
         )
         page = layout("Benutzerdetails", body, user, flash)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
